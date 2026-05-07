@@ -1,0 +1,79 @@
+# config.example.yaml — Copy this to config.yaml and fill in your values
+# Satisfies: Requirement 15
+
+account:
+  balance: 10000.0
+  currency: "USDT"
+
+position:
+  mode: "risk_pct"          # fixed_usd | risk_pct | kelly
+  fixed_usd: 100.0          # USD per trade when mode = fixed_usd
+  risk_pct: 0.02            # 2% per trade when mode = risk_pct
+  max_concurrent: 3
+  leverage: 5               # global default leverage
+
+regime:
+  enabled: true
+  adx_trending_threshold: 25
+  adx_choppy_threshold: 20
+  atr_parabolic_multiplier: 3.0
+  parabolic_score_multiplier: 0.6
+  ranging_score_multiplier: 0.85
+  trending_score_multiplier: 1.0
+
+risk:
+  max_daily_loss_pct: 0.05
+  max_drawdown_pct: 0.15
+  correlation_threshold: 0.8
+  max_correlated_risk_pct: 3.0
+  portfolio_heat_limit_pct: 6.0
+  atr_sl_multiplier: 1.5
+
+strategy:
+  active:
+    - "smc_ob_fvg"
+    - "pinbar"
+  score_threshold:
+    alert: 75
+    watch: 55
+  timeframes:
+    trigger: "15m"
+    context: "1h"
+    entry: "5m"
+  time_invalidation_candles: 15
+
+exchange:
+  name: "binance"           # ccxt exchange id
+  market_type: "futures"    # futures | spot
+  fee_rate: 0.001           # 0.1% taker
+  slippage_pct: 0.0002      # 0.02% estimated
+  testnet: true             # MUST be explicitly false for live trading
+
+assets:
+  - symbol: "BTC/USDT"
+    enabled: true
+    leverage: 10
+  - symbol: "ETH/USDT"
+    enabled: true
+    leverage: 7
+  - symbol: "SOL/USDT"
+    enabled: false
+    leverage: 5
+
+backtest:
+  start_date: "2024-01-01"
+  end_date: "2024-12-31"
+  walk_forward:
+    enabled: false
+    in_sample_days: 90
+    out_sample_days: 30
+    step_days: 30
+  min_trades_threshold: 30
+  overfit_degradation_threshold: 0.20
+
+logging:
+  level: "INFO"
+  save_all_signals: true
+  log_dir: "logs/"
+  signal_log_dir: "logs/signals/"
+  backtest_log_dir: "logs/backtest/"

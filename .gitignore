@@ -1,0 +1,92 @@
+# ============================================================
+# CRYPTO TRADING SYSTEM — .gitignore
+# Stack: Python (FastAPI/Celery) + React (Vite/TypeScript)
+# ============================================================
+
+# ─── Python ─────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+.eggs/
+
+# Testing & coverage
+.pytest_cache/
+.hypothesis/
+.coverage
+coverage.xml
+htmlcov/
+*.coveragerc
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+.pytype/
+
+# ─── Environment & Secrets ──────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# ─── Database files ─────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ─── Logs ───────────────────────────────────────────────────
+logs/
+*.log
+*.log.*
+
+# ─── Node / Frontend ────────────────────────────────────────
+workspace/frontend-workspace/node_modules/
+node_modules/
+dist/
+.vite/
+
+# Build output
+workspace/frontend-workspace/dist/
+workspace/frontend-workspace/build/
+
+# ─── IDE & Editor ───────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ─── Docker ─────────────────────────────────────────────────
+docker-compose.override.yml
+
+# ─── OS ─────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ─── Misc ───────────────────────────────────────────────────
+*.bak
+*.tmp
+*.orig
+.cache/

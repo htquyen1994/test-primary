@@ -1,0 +1,20 @@
+services:
+  # Redis only — fast, no build needed
+  # Celery workers run directly on Windows (faster, no Docker overhead)
+  redis:
+    image: redis:7-alpine
+    container_name: trading_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  redis_data:
