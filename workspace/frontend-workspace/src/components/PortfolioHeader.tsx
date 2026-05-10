@@ -48,6 +48,7 @@ export function PortfolioHeader() {
           <a href="/" className="text-gray-300 hover:text-white transition-colors">Signals</a>
           <a href="/journal" className="text-gray-300 hover:text-white transition-colors">Journal</a>
           <a href="/analytics" className="text-gray-300 hover:text-white transition-colors">Analytics</a>
+          <a href="/logs" className="text-gray-300 hover:text-white transition-colors">Logs</a>
           <span className="text-gray-700">|</span>
           <a href="/config/exchange" className="text-gray-400 hover:text-white transition-colors text-xs">Exchange</a>
           <a href="/config/trading" className="text-gray-400 hover:text-white transition-colors text-xs">Params</a>

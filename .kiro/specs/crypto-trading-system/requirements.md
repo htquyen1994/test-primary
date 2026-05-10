@@ -151,6 +151,8 @@ The architecture follows a three-layer design: **Layer 1 — Data Input** (OHLCV
 4. WHEN two or more confirmation factors are active simultaneously (e.g., SMC Order Block + VSA No Supply), THE Signal_Scorer SHALL produce a Score that is strictly greater than the Score produced by either factor alone.
 5. THE Signal_Scorer SHALL classify each Signal as ALERT (Score ≥ 75), WATCH (Score 55–74), or IGNORE (Score < 55).
 6. THE System SHALL allow all module point allocations and the ALERT/WATCH thresholds to be overridden via the Config_System without modifying source code.
+7. WHEN Order Book data is unavailable (bid_stack == 0 AND ask_stack == 0), THE Signal_Scorer SHALL cap the final Score at 60 to prevent a false ALERT from the most critical module being absent; the Signal_Card SHALL display an `ob_warning` field indicating Order Flow data is unavailable.
+8. WHEN the MTF Bias Filter (Requirement 20) produces Scenario A, THE Signal_Scorer SHALL add +10 pts to the final Score after normalization; WHEN Scenario B, THE Signal_Scorer SHALL subtract 10 pts; WHEN Scenario C, the signal SHALL be blocked before scoring.
 
 ---
 
@@ -365,3 +367,62 @@ The architecture follows a three-layer design: **Layer 1 — Data Input** (OHLCV
 8. WHEN `exchange.testnet` is set to `true` in the Config_System, THE Trade_Executor SHALL direct all order submissions to the exchange's testnet or paper-trading environment and SHALL NOT submit any order to the live market.
 9. THE System SHALL require `exchange.testnet` to be explicitly set to `false` in the Config_System before any live order is submitted; a missing or `true` value SHALL default to testnet mode.
 10. THE Trade_Executor SHALL monitor open positions and update the Trade_Journal with the final result (Win/Loss/BE), gross PnL, and net PnL (after fees and actual slippage) when the position is closed.
+
+---
+
+### Requirement 20: Multi-Timeframe Bias Filter (MTF)
+
+**User Story:** As a trader, I want the system to filter signals based on 4H and Daily timeframe bias, so that I never enter Long positions against a strong higher-timeframe downtrend.
+
+#### Acceptance Criteria
+
+1. THE System SHALL fetch and store 4H OHLCV data for all configured assets.
+2. THE System SHALL classify 4H bias as "bullish", "bearish", or "ranging" using EMA200 + market structure + ADX.
+3. WHEN 4H bias aligns with signal direction (Scenario A), THE System SHALL apply `size_multiplier = 1.0` and add +10 pts to score.
+4. WHEN 4H bias is ranging/choppy and 1H is aligned (Scenario B), THE System SHALL apply `size_multiplier = 0.5` and subtract 10 pts from score, and display warning on Signal Card.
+5. WHEN 4H bias directly opposes signal direction with ADX > 25 (Scenario C), THE System SHALL block the signal completely regardless of score, and log rejection reason as "4H_OPPOSING_TREND".
+6. THE System SHALL fetch Daily OHLCV and compute `weekly_bias` using EMA200 and EMA50.
+7. WHEN `weekly_bias = "BEAR"` and signal is Long, THE System SHALL apply additional `size_multiplier = 0.75`.
+
+---
+
+### Requirement 21: Enhanced Circuit Breaker
+
+**User Story:** As a trader, I want the system to automatically lock trading after significant losses, with smart unlock conditions that prevent re-entering the same losing market regime.
+
+#### Acceptance Criteria
+
+1. THE System SHALL lock trading for 12h after 3 consecutive losses within 24h (Trigger 1).
+2. THE System SHALL lock trading for 6h after a single trade loss exceeding 4% of equity (Trigger 2).
+3. THE System SHALL lock trading until 00:00 UTC when daily losses exceed 5% of equity (Trigger 3).
+4. THE System SHALL lock trading for 24h and require manual review when equity drops > 10% from 7-day peak (Trigger 4).
+5. WHEN lock expires, THE System SHALL only auto-unlock if the current market regime differs from the regime at time of lock.
+6. IF regime is unchanged at unlock time, THE System SHALL extend lock by 6h and notify user.
+7. THE Dashboard SHALL display Circuit Breaker status, countdown timer, and unlock button with required review note.
+
+---
+
+### Requirement 22: BTC Volatility Spike Guard
+
+**User Story:** As a trader, I want the system to automatically cancel Alt signals and warn about open positions when BTC makes a sudden large move, because Alt technical analysis becomes unreliable during BTC spikes.
+
+#### Acceptance Criteria
+
+1. THE System SHALL monitor BTC/USDT 15m candles for moves exceeding 2% in a single candle.
+2. WHEN BTC dumps > 2%/15m, THE System SHALL cancel all pending Alt alerts and push SL review warnings for open Alt long positions.
+3. WHEN BTC pumps > 2%/15m, THE System SHALL reduce position size by 50% for all new Alt long signals.
+4. WHEN Alt gain < 0.3× BTC gain during a BTC pump, THE System SHALL block Alt long signals completely (relative weakness).
+5. THE System SHALL enforce a 30-minute cooldown after any BTC spike before restoring normal Alt alert behavior.
+
+---
+
+### Requirement 23: Dynamic Order Flow Delta Threshold
+
+**User Story:** As a quant developer, I want the delta threshold for Order Flow scoring to adapt to current market liquidity, so that the threshold is meaningful on both high and low volume days.
+
+#### Acceptance Criteria
+
+1. THE System SHALL compute a dynamic delta threshold as `percentile_75(|delta_values_24h|) × 1.5`.
+2. THE System SHALL maintain a rolling 24h history of delta values per symbol in Redis.
+3. IF fewer than 10 historical delta values are available, THE System SHALL fall back to the configured static threshold (default 1000).
+4. THE System SHALL log both the current delta value and the dynamic threshold in every scoring cycle.

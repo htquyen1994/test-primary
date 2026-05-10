@@ -37,6 +37,7 @@ from api.schemas import (
     AnalyticsResponse, PortfolioResponse, BacktestRunRequest,
 )
 from api.routes.config_routes import router as config_router
+from trading_core.cache import get_async_redis, RedisKeys
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +51,18 @@ app = FastAPI(
     description="Semi-automatic crypto trading dashboard backend",
 )
 
+# Task 30.1: CORS — explicit origins only, no wildcard
+# Override via ALLOWED_ORIGINS env var for production (comma-separated)
+_allowed_origins_env = os.environ.get("ALLOWED_ORIGINS", "")
+_allowed_origins = (
+    [o.strip() for o in _allowed_origins_env.split(",") if o.strip()]
+    if _allowed_origins_env
+    else ["http://localhost:5173", "http://localhost:3000"]
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -64,8 +74,6 @@ app.include_router(config_router)
 # In-memory signal store (populated by Redis pub/sub listener)
 _active_signals: dict = {}
 _open_positions: dict = {}
-
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +104,28 @@ async def confirm_signal(signal_id: str):
     Confirm a signal → send to Trade Executor.
     Satisfies: Requirements 18.2, 18.3, 19.1
     """
+    # Task 32 — Circuit Breaker check: block CONFIRM when locked
+    try:
+        from risk.circuit_breaker import CircuitBreaker
+        cb = CircuitBreaker()
+        if cb.is_locked():
+            lock_info = cb.get_lock_info()
+            raise HTTPException(
+                status_code=423,  # 423 Locked
+                detail={
+                    "error": "CIRCUIT_BREAKER_ACTIVE",
+                    "message": f"Trading locked: {lock_info.trigger_type}",
+                    "trigger_detail": lock_info.trigger_detail,
+                    "unlock_at": lock_info.unlock_at.isoformat() if lock_info.unlock_at else None,
+                    "requires_review": lock_info.unlock_requires_review,
+                    "time_remaining_seconds": lock_info.time_remaining_seconds,
+                }
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Circuit breaker check failed (non-blocking): %s", exc)
+
     signal = _active_signals.get(signal_id)
     if not signal:
         raise HTTPException(status_code=404, detail=f"Signal {signal_id} not found")
@@ -311,6 +341,56 @@ async def reload_config():
 
 
 # ---------------------------------------------------------------------------
+# Circuit Breaker
+# ---------------------------------------------------------------------------
+
+@app.get("/api/circuit-breaker/status")
+async def get_circuit_breaker_status():
+    """Return current circuit breaker lock state."""
+    try:
+        from risk.circuit_breaker import CircuitBreaker
+        cb = CircuitBreaker()
+        info = cb.get_lock_info()
+        return {
+            "is_locked": info.is_locked,
+            "trigger_type": info.trigger_type,
+            "trigger_detail": info.trigger_detail,
+            "triggered_at": info.triggered_at.isoformat() if info.triggered_at else None,
+            "unlock_at": info.unlock_at.isoformat() if info.unlock_at else None,
+            "regime_at_trigger": info.regime_at_trigger,
+            "unlock_requires_review": info.unlock_requires_review,
+            "time_remaining_seconds": info.time_remaining_seconds,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/circuit-breaker/unlock")
+async def manual_unlock_circuit_breaker(body: dict):
+    """
+    Manually unlock circuit breaker with review note.
+    Required for Trigger 4 (drawdown from peak).
+    """
+    review_note = body.get("review_note", "")
+    if not review_note or len(review_note.strip()) < 10:
+        raise HTTPException(
+            status_code=400,
+            detail="review_note must be at least 10 characters"
+        )
+    try:
+        from risk.circuit_breaker import CircuitBreaker
+        cb = CircuitBreaker()
+        success = cb.manual_unlock(review_note=review_note, unlocked_by="user_dashboard")
+        if success:
+            return {"status": "unlocked", "message": "Circuit breaker manually unlocked"}
+        raise HTTPException(status_code=400, detail="Unlock failed — check logs")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
 # Backtest
 # ---------------------------------------------------------------------------
 
@@ -349,10 +429,9 @@ async def alert_stream(websocket: WebSocket):
     """
     await websocket.accept()
     try:
-        import aioredis
-        redis = await aioredis.from_url(REDIS_URL)
+        redis = await get_async_redis()
         pubsub = redis.pubsub()
-        await pubsub.subscribe("alerts:channel")
+        await pubsub.subscribe(RedisKeys.Channels.ALERTS)
         logger.info("WebSocket /ws/alerts connected")
         async for message in pubsub.listen():
             if message["type"] == "message":
@@ -374,8 +453,7 @@ async def alert_stream(websocket: WebSocket):
         logger.error("WebSocket /ws/alerts error: %s", exc)
     finally:
         try:
-            await pubsub.unsubscribe("alerts:channel")
-            await redis.close()
+            await pubsub.unsubscribe(RedisKeys.Channels.ALERTS)
         except Exception:
             pass
 
@@ -403,3 +481,32 @@ async def portfolio_stream(websocket: WebSocket):
         logger.info("WebSocket /ws/portfolio disconnected")
     except Exception as exc:
         logger.error("WebSocket /ws/portfolio error: %s", exc)
+
+
+@app.websocket("/ws/logs")
+async def log_stream(websocket: WebSocket):
+    """
+    Real-time system log stream — ALL signals including WATCH/IGNORE with debug breakdown.
+    Separate channel from alerts — does not affect signal scoring performance.
+    """
+    await websocket.accept()
+    try:
+        redis = await get_async_redis()
+        pubsub = redis.pubsub()
+        await pubsub.subscribe(RedisKeys.Channels.LOGS)
+        logger.info("WebSocket /ws/logs connected")
+        async for message in pubsub.listen():
+            if message["type"] == "message":
+                data = message["data"]
+                if isinstance(data, bytes):
+                    data = data.decode("utf-8")
+                await websocket.send_text(data)
+    except WebSocketDisconnect:
+        logger.info("WebSocket /ws/logs disconnected")
+    except Exception as exc:
+        logger.error("WebSocket /ws/logs error: %s", exc)
+    finally:
+        try:
+            await pubsub.unsubscribe(RedisKeys.Channels.LOGS)
+        except Exception:
+            pass

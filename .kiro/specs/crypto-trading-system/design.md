@@ -51,12 +51,20 @@ All tunable parameters are controlled through a single `config.yaml` file. The s
 │   ohlcv:{sym}:{tf}  │  delta:{sym}:5m  │  ob:{sym}:snap               │
 │   poc:{sym}         │  funding:{sym}   │  regime:{sym}                 │
 │   alerts:channel    │  correlation:matrix                               │
+│                                                                         │
+│   Phase 9 keys:                                                         │
+│   delta_history:{sym}  │  daily_bias:{sym} (TTL 4h)                    │
+│   btc_guard:spike      │  circuit_breaker:locked (fast-path cache)      │
+│                                                                         │
+│   Phase 9 pub/sub channels:                                             │
+│   cancel_all_alerts  │  btc_spike  │  circuit_breaker:events            │
+│   logs:channel (all signals including WATCH/IGNORE)                     │
 └──────────────────────────────────┬──────────────────────────────────────┘
                                    │
               ┌────────────────────┼────────────────────┐
-              │ Celery Beat        │ Celery Workers      │
-              │ (candle-close      │ (signal scoring,    │
-              │  scheduler)        │  regime detection)  │
+              │ ScoringService     │ asyncio + threading │
+              │ (candle_close      │ (signal scoring,    │
+              │  pub/sub trigger)  │  regime detection)  │
               └────────────────────┼────────────────────┘
                                    │
                                    ▼
@@ -70,17 +78,26 @@ All tunable parameters are controlled through a single `config.yaml` file. The s
 │  └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └───────┬───────┘  │
 │         └────────────────┼────────────────┼─────────────────┘          │
 │                          ▼                                              │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │  Phase 9 Filters (run BEFORE scoring)                           │   │
+│  │  MTFBiasDetector (engine/mtf_bias.py)  — 4H + Daily bias        │   │
+│  │  BTCVolatilityGuard (engine/btc_guard.py) — spike detection      │   │
+│  │  CircuitBreaker (risk/circuit_breaker.py) — 4 triggers           │   │
+│  └──────────────────────────────┬───────────────────────────────────┘   │
+│                                 ▼                                       │
 │              ┌───────────────────────────┐                              │
 │              │  Signal Scorer            │                              │
 │              │  raw + Confluence Bonus   │                              │
 │              │  × Regime Multiplier      │                              │
+│              │  + MTF score adjustment   │                              │
+│              │  data quality cap (≤60)   │                              │
 │              │  → Score [0–100]          │                              │
 │              └─────────────┬─────────────┘                              │
 │                            │                                            │
 │  ┌─────────────────────────▼──────────────────────────────────────┐     │
 │  │  Regime Detector  │  Correlation Manager  │  Risk Manager      │     │
 │  │  TRENDING/RANGING │  Rolling 24h Pearson  │  Position Sizing   │     │
-│  │  PARABOLIC/CHOPPY │  Portfolio Heat       │  Limit Enforcement │     │
+│  │  PARABOLIC/CHOPPY │  Portfolio Heat       │  + MTF/BTC mult.   │     │
 │  └─────────────────────────┬──────────────────────────────────────┘     │
 │                            │ publish alert (score ≥ 75)                 │
 └────────────────────────────┼────────────────────────────────────────────┘
@@ -107,8 +124,9 @@ All tunable parameters are controlled through a single `config.yaml` file. The s
 │  └──────────────────────────────────────────────────────────────────┘   │
 │                                 │                                       │
 │  ┌──────────────────────────────▼───────────────────────────────────┐   │
-│  │  PostgreSQL                                                      │   │
+│  │  SQL Server (production) / SQLite (local dev)                    │   │
 │  │  trade_journal  │  signal_log  │  backtest_results               │   │
+│  │  circuit_breaker_state (Phase 9)                                 │   │
 │  └──────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -620,14 +638,58 @@ logging:
 
 ### Overview
 
-The Signal Scorer aggregates four module scores plus a Confluence Bonus, applies the Regime Multiplier, and normalizes to [0, 100].
+The Signal Scorer aggregates four module scores plus a Confluence Bonus, applies the Regime Multiplier, and normalizes to [0, 100]. Phase 9 adds MTF score adjustment, data quality cap, and dynamic delta threshold.
 
 ```
 raw = OrderFlow(0-35) + SMC(0-30) + VSA+VolProfile(0-30) + Context(0-15) + Confluence(0-15)
 final = min(round(raw * regime_multiplier / 125 * 100), 100)
+
+# Phase 9 adjustments (applied after normalization):
+final += mtf_score_adjustment   # +10 (Scenario A) | -10 (Scenario B) | BLOCK (Scenario C)
+if not order_book_available:
+    final = min(final, 60)      # data quality cap
 ```
 
-**Satisfies:** Requirement 6.2, 6.3
+**Satisfies:** Requirement 6.2, 6.3, 6.7, 6.8
+
+### Scoring Pipeline (v2.0)
+
+```
+Candle closes (15m)
+        │
+        ▼
+[1] Regime Detector (ADX + ATR)
+        │
+        ▼
+[2] MTF Bias Filter (4H + Daily)          ← Phase 9
+    Scenario A: size × 1.0, score +10
+    Scenario B: size × 0.5, score -10, warning
+    Scenario C: BLOCK (return early, log rejection)
+        │
+        ▼
+[3] BTC Spike Guard (for Alt symbols)     ← Phase 9
+    Dump spike: cancel all Alt alerts, return early
+    Pump spike: size × 0.5
+    Cooldown: suppress for 30 min
+        │
+        ▼
+[4] Circuit Breaker check                 ← Phase 9
+    If locked: skip alert, log reason
+        │
+        ▼
+[5] Signal Scoring (OF + SMC + VSA + CTX + Bonus)
+    Dynamic delta threshold               ← Phase 9
+    Score capped at 60 if OB unavailable  ← Phase 9
+        │
+        ▼
+[6] Risk Manager
+    Apply MTF size multiplier            ← Phase 9
+    Apply Daily bias multiplier          ← Phase 9
+    Apply BTC spike multiplier           ← Phase 9
+        │
+        ▼
+[7] Publish alert / log
+```
 
 ### Module 1: Order Flow Analysis (max 35 pts)
 
@@ -636,14 +698,15 @@ def order_flow_score(delta: float, bid_stack: float, ask_stack: float,
                      absorption: bool, delta_threshold: float = 1000.0) -> float:
     """
     Measures institutional order flow pressure.
-    Satisfies: Requirement 6.2 (Order Flow component)
+    Satisfies: Requirement 6.2 (Order Flow component), Req 23
 
     Args:
         delta:           Cumulative buy_volume - sell_volume over last 5 candles
         bid_stack:       Total bid size at S/R zone
         ask_stack:       Total ask size at S/R zone
         absorption:      True if high volume but price did not move significantly
-        delta_threshold: Configurable threshold (default 1000 BTC-equivalent)
+        delta_threshold: Dynamic threshold = percentile_75(|delta_24h|) × 1.5
+                         Fallback: 1000.0 if fewer than 10 data points
     """
     score = 0.0
     # Institutional buying pressure
@@ -656,12 +719,29 @@ def order_flow_score(delta: float, bid_stack: float, ask_stack: float,
     if absorption:
         score += 10.0
     return min(score, 35.0)
+
+
+def compute_dynamic_delta_threshold(delta_history: list) -> float:
+    """
+    Dynamic threshold from 24h delta history.
+    threshold = percentile_75(abs(delta_values_24h)) × 1.5
+    Fallback to 1000.0 if fewer than 10 data points.
+    History stored in Redis: delta_history:{symbol} (96 values = 24h of 15m candles)
+    Satisfies: Requirement 23
+    """
+    if len(delta_history) < 10:
+        return 1000.0
+    abs_deltas = [abs(d) for d in delta_history if d != 0]
+    if not abs_deltas:
+        return 1000.0
+    p75 = float(np.percentile(abs_deltas, 75))
+    return max(100.0, min(p75 * 1.5, 50000.0))
 ```
 
 ### Module 2: SMC Analysis (max 30 pts)
 
 ```python
-def compute_smc_score(ohlcv_15m: pd.DataFrame, ohlcv_1h: pd.DataFrame) -> float:
+def compute_smc_score(ohlcv_15m: pd.DataFrame, ohlcv_1h: pd.DataFrame) -> SMCResult:
     """
     Smart Money Concepts: CHoCH, Order Block, Fair Value Gap.
     Satisfies: Requirement 6.2 (SMC component)
@@ -670,77 +750,24 @@ def compute_smc_score(ohlcv_15m: pd.DataFrame, ohlcv_1h: pd.DataFrame) -> float:
         CHoCH aligned with 1H bias:  +10 pts
         Order Block retest:          +10 pts
         FVG midpoint touched:        +10 pts
+
+    Returns SMCResult with:
+        order_blocks: List[OrderBlock]  — up to 3, sorted by Fib priority then proximity
+        order_block:  OrderBlock | None — best/retesting OB (primary)
+        htf_bias:     str               — computed here, used by MTF filter
     """
-    score = 0.0
-    htf_bias = _detect_htf_bias(ohlcv_1h)
-
-    # Change of Character (CHoCH)
-    choch = _detect_choch(ohlcv_15m)
-    if choch and _aligned_with_bias(choch["direction"], htf_bias):
-        score += 10.0
-
-    # Order Block retest
-    ob = _find_order_block(ohlcv_15m)
-    if ob and _price_retesting_ob(ohlcv_15m.iloc[-1], ob):
-        score += 10.0
-
-    # Fair Value Gap
-    fvg = _find_fvg(ohlcv_15m)
-    if fvg and _price_at_fvg_midpoint(ohlcv_15m.iloc[-1]["close"], fvg):
-        score += 10.0
-
-    return min(score, 30.0)
+    ...
 
 
-def _find_order_block(ohlcv: pd.DataFrame, atr_multiplier: float = 1.5) -> dict | None:
+def find_order_block(ohlcv: pd.DataFrame, atr_multiplier: float = 1.5,
+                     max_obs: int = 3) -> List[OrderBlock]:
     """
-    Identify the last opposing candle before a strong directional move.
-    OB is valid when: impulse candle body >= 1.5 * ATR(14).
-    Satisfies: Requirement 1.2 (OB mathematical logic)
+    Returns up to max_obs valid Order Blocks.
+    Sorted by: Fibonacci alignment (61.8% > 50% > 38.2%) first,
+               then by proximity to current price.
+    Satisfies: Requirement 1.2 (OB mathematical logic), Phase 9 Task 30.2
     """
-    atr = _compute_atr(ohlcv, 14).iloc[-1]
-    for i in range(len(ohlcv) - 2, 0, -1):
-        impulse = abs(ohlcv.iloc[i+1]["close"] - ohlcv.iloc[i+1]["open"])
-        if impulse >= atr_multiplier * atr:
-            if ohlcv.iloc[i+1]["close"] > ohlcv.iloc[i+1]["open"]:  # bullish impulse
-                if ohlcv.iloc[i]["close"] < ohlcv.iloc[i]["open"]:  # bearish OB candle
-                    return {
-                        "type":  "bullish",
-                        "high":  ohlcv.iloc[i]["high"],
-                        "low":   ohlcv.iloc[i]["low"],
-                        "mid":   (ohlcv.iloc[i]["high"] + ohlcv.iloc[i]["low"]) / 2,
-                        "index": i,
-                        "valid": True,
-                    }
-    return None
-
-
-def _find_fvg(ohlcv: pd.DataFrame) -> dict | None:
-    """
-    Three-candle imbalance: wick of candle[i-2] and wick of candle[i] do not overlap.
-    Satisfies: Requirement 1.2 (FVG mathematical logic)
-    """
-    for i in range(2, len(ohlcv)):
-        c1, c2, c3 = ohlcv.iloc[i-2], ohlcv.iloc[i-1], ohlcv.iloc[i]
-        # Bullish FVG: c1.high < c3.low
-        if c1["high"] < c3["low"]:
-            return {
-                "type": "bullish",
-                "top":  c3["low"],
-                "bot":  c1["high"],
-                "mid":  (c3["low"] + c1["high"]) / 2,
-                "filled": False,
-            }
-        # Bearish FVG: c1.low > c3.high
-        if c1["low"] > c3["high"]:
-            return {
-                "type": "bearish",
-                "top":  c1["low"],
-                "bot":  c3["high"],
-                "mid":  (c1["low"] + c3["high"]) / 2,
-                "filled": False,
-            }
-    return None
+    ...
 ```
 
 ### Module 3: VSA + Volume Profile (max 30 pts)
@@ -857,48 +884,25 @@ def compute_context_score(ohlcv_1h: pd.DataFrame, funding_rate: float,
 ### Confluence Bonus (max 15 pts)
 
 ```python
-def compute_confluence_bonus(ohlcv: pd.DataFrame, poc: float,
-                              vah: float, val: float) -> float:
+def compute_confluence_bonus(ohlcv, ob_or_obs, fvg, poc=0.0) -> float:
     """
-    Bonus for multi-layer confluence: OB + Fibonacci + POC + FVG.
+    Bonus for multi-layer confluence: OB + Fibonacci + FVG.
+    POC check REMOVED (Phase 9 fix) — POC belongs only in compute_vsa_score().
+    This prevents double-counting the same POC signal in both modules.
     Satisfies: Requirement 6.2 (Confluence Bonus), Requirement 6.4
 
-    Bonus table (normalized to max 15 after /125*100 normalization):
-        OB + Fib 61.8%:           +35 raw pts → ~28 normalized
-        OB + Fib 61.8% + POC:     +45 raw pts → ~36 normalized
-        OB + Fib 61.8% + POC+FVG: +55 raw pts → ~44 normalized
-    Note: raw bonus is capped at 15 in the normalized formula context.
+    Bonus table (raw points):
+        OB + Fib 38.2%:           +15 raw pts
+        OB + Fib 50%:             +25 raw pts
+        OB + Fib 61.8%:           +35 raw pts
+        OB + Fib 61.8% + FVG:     +45 raw pts  ← max raw = 45 (not 55)
+
+    Normalization: min(bonus / 45 * 15, 15.0)
+    Note: poc parameter kept for API compatibility but is ignored.
+
+    Accepts both single OrderBlock and List[OrderBlock] (Phase 9 Task 30.2).
     """
-    ob  = _find_order_block(ohlcv)
-    fvg = _find_fvg(ohlcv)
-    fib = _calc_fibonacci(ohlcv, lookback=50)
-
-    if not ob or not ob["valid"]:
-        return 0.0
-
-    bonus = 0.0
-    threshold = ob["mid"] * 0.005  # 0.5% tolerance
-
-    # Fibonacci confluence
-    fib_pts = {"618": 35, "500": 25, "382": 15, "786": 10}
-    for level, pts in fib_pts.items():
-        fib_price = fib.get(level, 0)
-        if fib_price and (ob["low"] <= fib_price <= ob["high"] or
-                          abs(fib_price - ob["mid"]) <= threshold):
-            bonus += pts
-            break
-
-    # POC confluence
-    if poc and abs(poc - ob["mid"]) <= threshold:
-        bonus += 10.0
-
-    # FVG confluence
-    if fvg and abs(fvg["mid"] - ob["mid"]) <= threshold:
-        bonus += 10.0
-
-    # Cap at 15 for the normalized formula (raw max 55 → normalized ~44,
-    # but the formula uses /125 so the effective cap is enforced there)
-    return min(bonus / 55 * 15, 15.0)
+    ...
 ```
 
 ---
@@ -1062,8 +1066,11 @@ import asyncio
 
 app = FastAPI(title="Crypto Trading System Dashboard API")
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"],
+app.add_middleware(CORSMiddleware,
+                   allow_origins=_allowed_origins,  # explicit origins, no wildcard
                    allow_methods=["*"], allow_headers=["*"])
+# ALLOWED_ORIGINS env var overrides defaults (comma-separated list)
+# Default: ["http://localhost:5173", "http://localhost:3000"]
 
 # ─── REST Endpoints ───────────────────────────────────────────────────────────
 
@@ -1076,6 +1083,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 
 # POST /api/signals/{signal_id}/confirm
 # Triggers Trade Executor for the given signal
+# Checks Circuit Breaker first — returns 423 Locked if active
 # Satisfies: Req 18.2, 18.3
 
 # POST /api/signals/{signal_id}/skip
@@ -1113,18 +1121,30 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 
 # POST /api/backtest/run
 # Body: {strategy, asset, timeframe, start_date, end_date}
-# Triggers async backtest run via Celery
+# Triggers async backtest run
 # Satisfies: Req 8, 9, 10
+
+# Phase 9 — Circuit Breaker endpoints:
+# GET  /api/circuit-breaker/status  — returns lock state, trigger type, time remaining
+# POST /api/circuit-breaker/unlock  — manual unlock with review_note (required for Trigger 4)
 
 # ─── WebSocket Endpoints ──────────────────────────────────────────────────────
 
 # WS /ws/alerts
-# Streams new Signal Cards in real time via Redis pub/sub
+# Streams new Signal Cards in real time via Redis pub/sub (alerts:channel)
+# Signal Card payload includes Phase 9 fields:
+#   data_quality, ob_warning, mtf_scenario, mtf_warning,
+#   bias_4h, daily_bias, size_multiplier
 # Satisfies: Req 18.10
 
 # WS /ws/portfolio
 # Streams Portfolio_Heat and correlated risk updates
 # Satisfies: Req 14.8, 18.9, 18.10
+
+# WS /ws/logs
+# Streams ALL signals (ALERT + WATCH + IGNORE) with full debug breakdown
+# Separate channel from alerts — does not affect scoring performance
+# Satisfies: Req 17.1
 ```
 
 ```python
@@ -1189,7 +1209,9 @@ D:\workspace\trade-workspace\workspace\
 │   │
 │   ├── db/                          # Database layer (SQL)
 │   │   ├── migrations/
-│   │   │   └── 001_initial_schema.sql  # signal_log, trade_journal, backtest_results
+│   │   │   ├── 001_initial_schema.sql  # signal_log, trade_journal, backtest_results
+│   │   │   ├── 002_config_versions.sql
+│   │   │   └── 003_circuit_breaker.sql # Phase 9: circuit_breaker_state table
 │   │   ├── connection.py            # SQLAlchemy engine (DATABASE_URL env var)
 │   │   └── models.py                # SQLAlchemy ORM models
 │   │
@@ -1253,11 +1275,15 @@ D:\workspace\trade-workspace\workspace\
 │   │   ├── confluence.py
 │   │   ├── regime_detector.py
 │   │   ├── correlation_manager.py
+│   │   ├── mtf_bias.py              # Phase 9: MTFBiasDetector (4H + Daily)
+│   │   ├── btc_guard.py             # Phase 9: BTCVolatilityGuard
+│   │   ├── scoring_service.py       # ScoringService (asyncio + threading)
 │   │   └── tasks.py                 # Celery tasks
 │   │
 │   ├── risk/                        # Risk Management (Req 7, 14)
 │   │   ├── manager.py
 │   │   ├── position_sizer.py
+│   │   ├── circuit_breaker.py       # Phase 9: CircuitBreaker (4 triggers)
 │   │   └── validator.py
 │   │
 │   ├── alert/                       # Alert Building (Req 17, 18)
@@ -1332,16 +1358,41 @@ D:\workspace\trade-workspace\workspace\
             └── index.ts
 ```
 
-### Database: SQL
+### Database: SQL Server / SQLite
 
 The system uses **SQLAlchemy** with a SQL backend. `DATABASE_URL` in the environment controls the engine:
 
 | Environment | `DATABASE_URL` example | Notes |
 |-------------|------------------------|-------|
 | Local dev / test | `sqlite:///./trading.db` | Zero-config, file-based |
-| Production | `postgresql://user:pass@host/trading` | Full ACID, concurrent writes |
+| Production | `mssql+pyodbc://...` | SQL Server (Windows production) |
 
-All schema is defined in plain SQL migration files (`db/migrations/`). SQLAlchemy ORM models in `db/models.py` map to the same schema. No ORM-specific migration tool (Alembic) is required for MVP — migrations are applied manually via `psql` or `sqlite3`.
+All schema is defined in plain SQL migration files (`db/migrations/`). SQLAlchemy ORM models in `db/models.py` map to the same schema.
+
+#### Phase 9: circuit_breaker_state Table (Migration 003)
+
+```sql
+-- db/migrations/003_circuit_breaker.sql
+-- Satisfies: Requirement 21 (Phase 9 Circuit Breaker)
+CREATE TABLE IF NOT EXISTS circuit_breaker_state (
+    id                    INT IDENTITY(1,1) PRIMARY KEY,
+    triggered_at          DATETIME2 NOT NULL DEFAULT GETUTCDATE(),
+    unlock_at             DATETIME2 NOT NULL,
+    trigger_type          NVARCHAR(50) NOT NULL,
+        -- 'CONSECUTIVE_LOSSES' | 'LOSS_MAGNITUDE' | 'DAILY_LOSS_CAP' | 'DRAWDOWN_FROM_PEAK'
+    trigger_detail        NVARCHAR(500) NULL,
+    regime_at_trigger     NVARCHAR(20) NOT NULL DEFAULT 'UNKNOWN',
+    is_locked             BIT NOT NULL DEFAULT 1,
+    unlock_requires_review BIT NOT NULL DEFAULT 0,
+        -- True for Trigger 4 (drawdown from peak) — requires manual review note
+    review_note           NVARCHAR(1000) NULL,
+    unlocked_at           DATETIME2 NULL,
+    unlocked_by           NVARCHAR(100) NULL,
+        -- 'auto_regime_change' | 'manual_user' | 'timer_expired'
+    created_at            DATETIME2 NOT NULL DEFAULT GETUTCDATE()
+);
+CREATE INDEX IF NOT EXISTS idx_cb_is_locked ON circuit_breaker_state (is_locked, unlock_at);
+```
 
 
 ---
@@ -1775,3 +1826,36 @@ Each property test must:
 **Rationale:** The dashboard is a single-page application with no SEO requirements. WebSocket connections are long-lived and stateful — SSR would complicate connection management. React + Vite provides faster development iteration and simpler deployment as static files served by FastAPI or nginx.
 
 **Satisfies:** Requirement 18
+
+### 9. REST Polling vs WebSocket for OHLCV
+
+**Decision:** Use REST polling (ccxt `fetch_ohlcv`) instead of WebSocket for OHLCV ingestion.
+
+**Rationale:** The current implementation uses `OHLCVService` with REST polling at configurable intervals (15m candles polled every 60s, 4H every 300s, Daily every 3600s). This avoids WebSocket connection management complexity and is sufficient for the 15m trigger timeframe. WebSocket ingestion (Req 2.1–2.6) is planned but not yet implemented.
+
+**Trade-off:** REST polling introduces up to 60s latency on candle close detection for 15m candles. Acceptable for semi-auto trading where the user has 15 minutes to confirm.
+
+**Satisfies:** Requirement 2 (partially — REST polling instead of WebSocket)
+
+### 10. ScoringService Threading Model
+
+**Decision:** `ScoringService` uses `asyncio + threading` (not Celery) for scoring trigger.
+
+**Rationale:** The scoring trigger subscribes to `candle_close` Redis pub/sub in a background thread (`threading.Thread`), then dispatches scoring coroutines via `asyncio.run_coroutine_threadsafe()`. This avoids Celery worker setup complexity while maintaining non-blocking behavior. The `OHLCVService`, `OrderBookService`, and `DeltaService` are all async classes orchestrated by `asyncio.gather()` in `main.py`.
+
+**Alternative considered:** Celery workers — more complex setup, requires broker configuration, overkill for single-machine deployment.
+
+**Satisfies:** Requirement 6 (signal scoring pipeline)
+
+### 11. MTF 3-Scenario Filter Rationale
+
+**Decision:** Three discrete scenarios (A/B/C) for MTF alignment rather than a continuous multiplier.
+
+**Rationale:**
+- **Scenario A** (4H aligned): Full confidence — no size reduction, +10 score bonus rewards alignment
+- **Scenario B** (4H ranging): Partial confidence — 50% size reduction and -10 score penalty signals uncertainty without blocking
+- **Scenario C** (4H opposing with ADX > 25): Zero confidence — hard block prevents entering against a confirmed strong trend, regardless of 15m score
+
+The hard block in Scenario C is intentional: a 15m signal scoring 90/100 against a strong 4H downtrend is more likely a dead-cat bounce than a genuine reversal. The ADX > 25 requirement prevents blocking during sideways 4H markets that happen to be slightly bearish.
+
+**Satisfies:** Requirement 20

@@ -43,6 +43,8 @@ class ScoreInput:
     regime_multiplier: float = 1.0
     direction: str = "long"     # "long" | "short"
     regime: str = "RANGING"     # for PARABOLIC short suppression
+    # Data quality flags — used to cap score when critical modules are missing
+    order_book_available: bool = True   # False when bid_stack == ask_stack == 0
 
 
 @dataclass
@@ -52,6 +54,16 @@ class ScoreOutput:
     final_score: int            # [0, 100]
     classification: str         # "ALERT" | "WATCH" | "IGNORE"
     suppressed: bool = False    # True if short suppressed in PARABOLIC
+    # Data quality metadata
+    data_quality: dict = None   # {"order_flow_available": bool, "order_book_available": bool}
+
+    def __post_init__(self):
+        if self.data_quality is None:
+            self.data_quality = {"order_flow_available": True, "order_book_available": True}
+
+
+# Score cap when Order Book data is unavailable (prevents false ALERT)
+SCORE_CAP_NO_ORDER_BOOK = 60
 
 
 class SignalScorer:
@@ -123,6 +135,17 @@ class SignalScorer:
         final = min(round(raw * multiplier / MAX_RAW_SCORE * 100), 100)
         final = max(0, final)  # ensure non-negative
 
+        # --- Data quality cap (Task 30.4) ---
+        # When Order Book is unavailable (bid_stack == ask_stack == 0),
+        # cap score at 60 to prevent false ALERT from the most critical module missing.
+        order_book_available = inputs.order_book_available
+        if not order_book_available and final > SCORE_CAP_NO_ORDER_BOOK:
+            logger.warning(
+                "Order Book data unavailable — score capped at %d (was %d)",
+                SCORE_CAP_NO_ORDER_BOOK, final,
+            )
+            final = SCORE_CAP_NO_ORDER_BOOK
+
         classification = self.classify(final)
 
         return ScoreOutput(
@@ -130,6 +153,10 @@ class SignalScorer:
             final_score=final,
             classification=classification,
             suppressed=False,
+            data_quality={
+                "order_flow_available": of_score > 0,
+                "order_book_available": order_book_available,
+            },
         )
 
     def classify(self, final_score: int) -> str:

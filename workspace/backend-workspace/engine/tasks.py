@@ -204,21 +204,20 @@ if celery_app is not None:
         Celery task: triggered on candle close.
         Reads from Redis, runs pipeline, publishes alerts.
         """
-        import redis as redis_lib
         import json
+        from trading_core.cache import get_redis, RedisKeys
 
-        redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-        r = redis_lib.from_url(redis_url)
+        r = get_redis()
 
         # Read data from Redis
-        ohlcv_raw = r.lrange(f"ohlcv:{symbol}:{timeframe}", 0, 499)
-        ohlcv_1h_raw = r.lrange(f"ohlcv:{symbol}:1h", 0, 99)
-        delta = float(r.get(f"delta:{symbol}:5m") or 0)
-        poc = float(r.get(f"poc:{symbol}") or 0)
-        funding_raw = r.get(f"funding:{symbol}")
+        ohlcv_raw = r.lrange(RedisKeys.ohlcv(symbol, timeframe), 0, 499)
+        ohlcv_1h_raw = r.lrange(RedisKeys.ohlcv(symbol, "1h"), 0, 99)
+        delta = float(r.get(RedisKeys.delta(symbol)) or 0)
+        poc = float(r.get(RedisKeys.poc(symbol)) or 0)
+        funding_raw = r.get(RedisKeys.funding(symbol))
         funding_rate = json.loads(funding_raw).get("rate", 0.0) if funding_raw else 0.0
 
-        ob_raw = r.get(f"ob:{symbol}:snap")
+        ob_raw = r.get(RedisKeys.ob_snap(symbol))
         ob_data = json.loads(ob_raw) if ob_raw else {}
         bid_stack = ob_data.get("bid_stack", 0.0)
         ask_stack = ob_data.get("ask_stack", 0.0)

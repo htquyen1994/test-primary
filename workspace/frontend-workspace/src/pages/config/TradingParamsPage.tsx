@@ -12,7 +12,11 @@ export function TradingParamsPage() {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [saveMsg, setSaveMsg] = useState<string | null>(null)
-  const [versionTag, setVersionTag] = useState('')
+  const [versionTag, setVersionTag] = useState(() => {
+    // Auto-generate a default version tag based on current date
+    const now = new Date()
+    return `v${now.getFullYear()}.${String(now.getMonth()+1).padStart(2,'0')}.${String(now.getDate()).padStart(2,'0')}`
+  })
   const [versionNote, setVersionNote] = useState('')
   const [showHistory, setShowHistory] = useState(false)
 
@@ -188,19 +192,25 @@ export function TradingParamsPage() {
       {/* Save with version */}
       <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-3">
         <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">Save New Version</h2>
+        <p className="text-xs text-gray-500">
+          Fill in a version tag below, then click Save. Each save creates a new versioned snapshot — you can rollback anytime.
+        </p>
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <label className="block text-xs text-gray-500 mb-1">Version Tag *</label>
+            <label className="block text-xs text-gray-400 mb-1">
+              Version Tag <span className="text-red-400">*</span>
+              <span className="text-gray-600 ml-1">(required to enable Save)</span>
+            </label>
             <input
               type="text"
               value={versionTag}
               onChange={e => setVersionTag(e.target.value)}
               placeholder="e.g. v1.1-aggressive"
-              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-gray-500"
+              className="w-full bg-gray-800 border border-gray-600 rounded-lg px-3 py-1.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
             />
           </div>
           <div>
-            <label className="block text-xs text-gray-500 mb-1">Version Note</label>
+            <label className="block text-xs text-gray-400 mb-1">Version Note (optional)</label>
             <input
               type="text"
               value={versionNote}
@@ -213,12 +223,12 @@ export function TradingParamsPage() {
         <button
           onClick={handleSave}
           disabled={saving || !versionTag.trim()}
-          className="w-full py-2 bg-green-600 hover:bg-green-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold text-sm rounded-lg transition-colors"
+          className="w-full py-2.5 bg-green-600 hover:bg-green-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold text-sm rounded-lg transition-colors"
         >
-          {saving ? 'Saving...' : 'Save & Activate New Version'}
+          {saving ? 'Saving...' : versionTag.trim() ? `Save & Activate "${versionTag}"` : 'Enter a version tag above to save'}
         </button>
         <p className="text-xs text-gray-600">
-          Previous version is kept in history. You can rollback anytime.
+          Previous version is kept in history. You can rollback anytime from the Version History panel above.
         </p>
       </div>
     </div>

@@ -14,7 +14,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
-    restart: unless-stopped
+    restart: always   # Auto-start when Docker Desktop opens
 
 volumes:
   redis_data:

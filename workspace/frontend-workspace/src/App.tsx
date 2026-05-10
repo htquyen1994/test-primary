@@ -11,6 +11,7 @@ import { JournalPage } from './pages/JournalPage'
 import { AnalyticsPage } from './pages/AnalyticsPage'
 import { ExchangeConfigPage } from './pages/config/ExchangeConfigPage'
 import { TradingParamsPage } from './pages/config/TradingParamsPage'
+import { LogPage } from './pages/LogPage'
 
 export default function App() {
   return (
@@ -26,6 +27,7 @@ export default function App() {
                 <Route path="/analytics" element={<AnalyticsPage />} />
                 <Route path="/config/exchange" element={<ExchangeConfigPage />} />
                 <Route path="/config/trading" element={<TradingParamsPage />} />
+                <Route path="/logs" element={<LogPage />} />
               </Routes>
             </main>
           </div>

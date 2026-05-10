@@ -951,3 +951,239 @@ All backend tasks are executed inside `backend-workspace\`. All frontend tasks a
 - Testnet mode is enforced at the code level in Task 25.2 and is never optional
 - Docker Compose (Redis + PostgreSQL + Celery) is set up in Task 1.2 as a prerequisite for all subsequent tasks
 - The `exchange.testnet` flag must be explicitly set to `false` in `config.yaml` before any live order is submitted; any other value defaults to testnet
+
+---
+
+## Phase 9 — Trading System Enhancements (v2.0)
+
+> Priority order: Critical bugs first → MTF filter → BTC guard → Circuit breaker → Dynamic threshold → Daily bias
+
+---
+
+### Issue 1 — Critical Bugs Fix
+
+- [x] 30. Fix critical scoring bugs
+  - [x] 30.1 Fix CORS wildcard security issue (`api/main.py`)
+    - Replace `allow_origins=["*"]` with explicit origins: `["http://localhost:5173", "http://localhost:3000"]`
+    - Add environment variable `ALLOWED_ORIGINS` for production override
+    - _Priority: Medium_
+
+  - [x] 30.2 Fix Order Block detection returning only 1 OB (`engine/smc.py`)
+    - Change `find_order_block()` to return `List[OrderBlock]` instead of `Optional[OrderBlock]`
+    - Return up to 3 most recent valid OBs, sorted by proximity to current price
+    - Prioritize OBs that coincide with Fibonacci levels (61.8%, 50%)
+    - Update `compute_smc_score()` to check all returned OBs and score the best match
+    - Update `SMCResult` dataclass: `order_block: Optional[OrderBlock]` → `order_blocks: List[OrderBlock]`
+    - _Priority: High_
+
+  - [x] 30.3 Fix Confluence bonus double-counting (`engine/confluence.py`, `engine/vsa.py`)
+    - POC bonus is currently counted in BOTH `compute_vsa_score()` (+10 pts) AND `compute_confluence_bonus()` (+10 pts)
+    - Fix: POC proximity bonus belongs ONLY in `compute_vsa_score()` (VSA module)
+    - Remove POC check from `compute_confluence_bonus()` — confluence bonus only for OB+Fib+FVG combinations
+    - Add unit test to verify total score with POC active does not exceed expected maximum
+    - _Priority: High_
+
+  - [x] 30.4 Fix ALERT when Order Flow score = 0 (`engine/scoring_service.py`, `engine/scorer.py`)
+    - When `bid_stack == 0 AND ask_stack == 0` (Order Book not available), cap final score at 60
+    - This prevents ALERT (threshold 75) when the most important module has no data
+    - Add `data_quality` field to `ScoreOutput`: `{"order_flow_available": bool, "order_book_available": bool}`
+    - Signal Card must display warning: "⚠ Order Flow data unavailable — score capped at 60"
+    - Log warning in scoring cycle when OF data is missing
+    - _Priority: Critical_
+
+---
+
+### Issue 2 — MTF 4H Filter
+
+- [x] 31. Implement Multi-Timeframe 4H + Daily bias filter
+  - [x] 31.1 Add 4H OHLCV feed to `data/ohlcv_service.py`
+    - Add "4h" to default timeframes list alongside "15m" and "1h"
+    - Store in Redis: `ohlcv:{symbol}:4h` (ring buffer 200 candles)
+    - Poll interval: 300s (5 minutes)
+    - _Requirements: New_
+
+  - [x] 31.2 Implement `MTFBiasDetector` class (`engine/mtf_bias.py`)
+    - `detect_4h_bias(ohlcv_4h: DataFrame) -> str`: returns "bullish" | "bearish" | "ranging"
+    - Logic: price > EMA200 AND higher lows AND ADX > 20 → "bullish"
+    - Logic: price < EMA200 AND lower highs AND ADX > 20 → "bearish"
+    - Logic: ADX < 20 OR price oscillating around EMA200 → "ranging"
+    - `detect_daily_bias(ohlcv_daily: DataFrame) -> str`: returns "BULL" | "BEAR" | "NEUTRAL"
+    - Logic: close < MA200 AND close < MA50 → "BEAR"; close > MA200 AND close > MA50 → "BULL"
+    - `get_mtf_alignment(bias_4h, bias_1h, signal_direction) -> MTFAlignment`
+    - Returns: `MTFAlignment(scenario, size_multiplier, score_adjustment, warning_message)`
+
+  - [x] 31.3 Implement 3 MTF scenarios in `engine/mtf_bias.py`
+    - **Scenario A — Aligned** (4H + 1H same direction as signal):
+      - `size_multiplier = 1.0`, `score_adjustment = +10`, `warning = None`
+    - **Scenario B — Diverging** (4H ranging/choppy, 1H aligned):
+      - `size_multiplier = 0.5`, `score_adjustment = -10`, `warning = "4H không xác nhận — size giảm 50%"`
+    - **Scenario C — Opposing** (4H trending opposite to signal, ADX > 25):
+      - `size_multiplier = 0.0` (BLOCK), `score_adjustment = -999` (force IGNORE)
+      - `warning = "BLOCKED: 4H downtrend — Long bị vô hiệu hóa"`
+      - Log reason in signal_log with `rejection_reason = "4H_OPPOSING_TREND"`
+
+  - [x] 31.4 Integrate MTF filter into `engine/scoring_service.py`
+    - Read `ohlcv:4h` from Redis in `_run_cycle()`
+    - Call `MTFBiasDetector.get_mtf_alignment()` after regime detection
+    - Apply `score_adjustment` to final score
+    - Apply `size_multiplier` to position size in Risk Manager
+    - Add `mtf_alignment` field to log entry and Signal Card
+    - If Scenario C → return early, do not publish alert
+
+  - [x] 31.5 Update Signal Card frontend to show MTF warning
+    - Add `mtf_warning` field to Signal Card payload
+    - Display orange warning badge on Signal Card when Scenario B
+    - Display red "BLOCKED" badge when Scenario C (should not appear in alerts, but handle gracefully)
+    - _Requirements: New_
+
+---
+
+### Issue 3 — Circuit Breaker (Enhanced)
+
+- [-] 32. Implement enhanced Circuit Breaker with 4 triggers
+  - [x] 32.1 Create `risk/circuit_breaker.py` — CircuitBreaker class
+    - Store state in SQL Server table `circuit_breaker_state` (new migration)
+    - Fields: `id`, `triggered_at`, `unlock_at`, `trigger_type`, `trigger_detail`, `regime_at_trigger`, `is_locked`, `unlock_requires_review`
+    - `is_locked() -> bool`: check if currently locked
+    - `get_lock_info() -> dict`: return lock reason, unlock time, conditions
+
+  - [x] 32.2 Implement 4 trigger conditions
+    - **Trigger 1 — Consecutive losses**: 3 losses in 24h → lock 12h
+    - **Trigger 2 — Loss magnitude**: single trade loss > 4% equity → lock 6h
+    - **Trigger 3 — Daily loss cap**: total daily loss > 5% equity → lock until 00:00 UTC
+    - **Trigger 4 — Drawdown from peak**: equity drops > 10% from 7-day high → lock 24h + require manual review
+    - Each trigger stores `regime_at_trigger` (current regime when triggered)
+
+  - [x] 32.3 Implement smart unlock conditions
+    - After lock expires: check if `current_regime != regime_at_trigger`
+    - If regime unchanged → extend lock by 6h, notify user "Thị trường vẫn cùng regime gây thua"
+    - If regime changed → allow unlock
+    - If `unlock_requires_review = True` → always require manual confirmation regardless of regime
+    - Add `POST /api/circuit-breaker/unlock` endpoint with required `review_note` field
+
+  - [ ] 32.4 Integrate Circuit Breaker into signal pipeline
+    - Check `circuit_breaker.is_locked()` in `scoring_service._run_cycle()` before publishing alerts
+    - If locked → skip alert publishing, log reason
+    - Check after each trade result in `trade/journal.py` → call `circuit_breaker.check_triggers()`
+    - Add Circuit Breaker status to Dashboard header (red lock icon when active)
+
+  - [ ] 32.5 Add Circuit Breaker UI to frontend
+    - Show lock status in `PortfolioHeader.tsx`
+    - Show unlock countdown timer
+    - Show unlock button (only when lock expired + conditions met)
+    - Require text input for review note when manual unlock needed
+
+---
+
+### Issue 4 — BTC Correlation Guard (Black Swan Protection)
+
+- [x] 33. Implement BTC volatility spike guard
+  - [x] 33.1 Create `engine/btc_guard.py` — BTCVolatilityGuard class
+    - Monitor BTC/USDT 15m candles for sudden moves
+    - `check_btc_spike(ohlcv_btc_15m: DataFrame) -> BTCSpikeResult`
+    - Returns: `BTCSpikeResult(spike_detected, direction, magnitude_pct, cooldown_until)`
+    - Spike threshold: `|close - open| / open > 0.02` (2% in single 15m candle)
+    - Store spike state in Redis: `btc_guard:spike` with TTL = cooldown duration
+
+  - [x] 33.2 Implement 3 spike scenarios
+    - **BTC dump > 2%/15m**:
+      - Cancel ALL Alt alerts (publish `cancel_all_alerts` event to Redis)
+      - Push warning to open Alt long positions: "⚠ BTC spike down — review SL immediately"
+      - Reset delta for all Alt symbols (delta data no longer valid)
+      - Cooldown: 30 minutes
+    - **BTC pump > 2%/15m**:
+      - Reduce size 50% for all new Alt long signals
+      - Check relative strength: if Alt gain < 0.3× BTC gain → block Alt long completely
+      - Cooldown: 30 minutes
+    - **Cooldown period (0-30 min after spike)**:
+      - All Alt alerts suppressed regardless of score
+      - Log reason: "BTC_SPIKE_COOLDOWN"
+
+  - [x] 33.3 Integrate BTC guard into scoring pipeline
+    - Check `btc_guard.check_btc_spike()` in `scoring_service._run_cycle()` for non-BTC symbols
+    - Apply size multiplier from spike result
+    - Add `btc_guard_active` field to Signal Card and log entry
+    - Add BTC spike warning to Signal Card UI
+
+  - [x] 33.4 Add BTC spike monitoring to `data/ohlcv_service.py`
+    - Always monitor BTC/USDT 15m regardless of configured assets
+    - Publish `btc_spike` event to Redis when spike detected
+    - ScoringService subscribes to `btc_spike` channel
+
+---
+
+### Issue 5 — Dynamic Delta Threshold
+
+- [x] 34. Implement dynamic Order Flow delta threshold
+  - [x] 34.1 Update `engine/order_flow.py` — replace hardcoded threshold
+    - Remove `DEFAULT_DELTA_THRESHOLD = 1000.0`
+    - Add `compute_dynamic_delta_threshold(delta_history: List[float]) -> float`
+    - Logic: `threshold = percentile_75(abs(delta_values_24h)) * 1.5`
+    - Fallback to 1000.0 if fewer than 10 data points available
+    - Store rolling delta history in Redis: `delta_history:{symbol}` (list of last 96 values = 24h of 15m candles)
+
+  - [x] 34.2 Update `DeltaService` to maintain delta history
+    - After each candle close, append current delta to `delta_history:{symbol}` list
+    - Keep last 96 values (24h × 4 per hour = 96 for 15m TF)
+    - Expose `get_delta_threshold(symbol) -> float` method
+
+  - [x] 34.3 Update scoring to use dynamic threshold
+    - Pass `dynamic_threshold` to `compute_order_flow_score()`
+    - Log both `delta_value` and `dynamic_threshold` in scoring log for transparency
+    - Show dynamic threshold in Log Page UI
+
+---
+
+### Issue 6 — Daily/Weekly Bias Filter
+
+- [x] 35. Implement Daily timeframe macro bias filter
+  - [x] 35.1 Add Daily OHLCV feed to `data/ohlcv_service.py`
+    - Add "1d" to timeframes list
+    - Store in Redis: `ohlcv:{symbol}:1d` (ring buffer 250 candles = ~1 year)
+    - Poll interval: 3600s (1 hour) — daily candles change slowly
+    - Fetch 250 historical candles on startup for MA200 calculation
+
+  - [x] 35.2 Implement `detect_daily_bias()` in `engine/mtf_bias.py`
+    - Compute EMA200 and EMA50 on daily closes
+    - `weekly_bias = "BEAR"` if: close < EMA200 AND close < EMA50 AND 3+ lower highs in last 10 days
+    - `weekly_bias = "BULL"` if: close > EMA200 AND close > EMA50 AND 3+ higher lows in last 10 days
+    - `weekly_bias = "NEUTRAL"` otherwise
+    - Store in Redis: `daily_bias:{symbol}` with TTL 4h
+
+  - [x] 35.3 Apply daily bias position size reduction
+    - When `weekly_bias = "BEAR"` AND signal direction = "long":
+      - Apply additional `size_multiplier *= 0.75` (25% reduction on top of MTF adjustment)
+      - Add warning to Signal Card: "⚠ Daily bearish — size giảm thêm 25%"
+    - When `weekly_bias = "BULL"` AND signal direction = "long":
+      - No additional reduction
+    - Combine with MTF 4H multiplier: `final_size = base_size × mtf_multiplier × daily_multiplier`
+
+  - [x] 35.4 Add daily bias to scoring log and Signal Card
+    - Include `daily_bias`, `ema200_daily`, `ema50_daily` in log entry
+    - Show daily bias indicator on Signal Card
+
+---
+
+### Issue 7 — USDT Dominance (PENDING)
+
+- [ ]* 36. USDT Dominance as Fear/Greed proxy — PENDING
+  - Pending: CoinGecko API integration, rate limit handling
+  - Will be implemented in a future sprint
+  - Placeholder: `dominance:USDT` Redis key reserved
+
+---
+
+### Phase 9 Checkpoint
+
+- [ ] 37. Phase 9 integration test and verification
+  - [ ] 37.1 Write unit tests for all new modules
+    - `tests/unit/test_mtf_bias.py` — 3 scenarios, edge cases
+    - `tests/unit/test_circuit_breaker.py` — 4 triggers, unlock conditions
+    - `tests/unit/test_btc_guard.py` — spike detection, cooldown
+    - `tests/unit/test_dynamic_delta.py` — threshold calculation
+  - [ ] 37.2 Integration test: full scoring cycle with all Phase 9 filters active
+    - Verify Scenario C blocks signal even with score 95
+    - Verify Circuit Breaker prevents CONFIRM when locked
+    - Verify BTC spike cancels Alt alerts
+  - [ ] 37.3 Update `project/design/BACKEND_ARCHITECTURE.md` with Phase 9 components
+  - [ ] 37.4 Verify all existing 319 tests still pass after Phase 9 changes

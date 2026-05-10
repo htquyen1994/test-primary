@@ -311,39 +311,37 @@ def save_exchange_settings(data: dict, db_session) -> str:
 
 def build_ccxt_exchange(db_session):
     """
-    Build and return a ccxt exchange instance from active ExchangeSettings.
+    Build and return an ExchangeClient from active ExchangeSettings.
+    Uses trading_core.exchange.get_exchange_client for singleton management.
     Automatically routes to testnet if testnet=True.
     """
-    import ccxt
+    from trading_core.exchange.client import ExchangeClient
 
     settings = get_active_exchange_settings(db_session)
     exchange_id = settings["exchange_id"]
 
-    if not hasattr(ccxt, exchange_id):
-        raise ValueError(f"Exchange '{exchange_id}' not supported by ccxt")
-
-    exchange_class = getattr(ccxt, exchange_id)
-    params = {
+    options = {
         "apiKey": settings["api_key"],
         "secret": settings["api_secret"],
         "enableRateLimit": True,
     }
     if settings.get("passphrase"):
-        params["password"] = settings["passphrase"]
+        options["password"] = settings["passphrase"]
 
-    exchange = exchange_class(params)
+    # For trading (with API key), create a dedicated non-singleton instance
+    client = ExchangeClient(exchange_id, options)
 
     # Enable testnet/sandbox mode
     if settings["testnet"]:
-        if hasattr(exchange, "set_sandbox_mode"):
-            exchange.set_sandbox_mode(True)
-        elif "test" in exchange.urls:
-            exchange.urls["api"] = exchange.urls["test"]
+        if hasattr(client._exchange, "set_sandbox_mode"):
+            client._exchange.set_sandbox_mode(True)
+        elif "test" in client._exchange.urls:
+            client._exchange.urls["api"] = client._exchange.urls["test"]
         logger.info("Exchange %s running in TESTNET mode", exchange_id)
     else:
         logger.warning("Exchange %s running in LIVE mode — real money!", exchange_id)
 
-    return exchange
+    return client
 
 
 # ---------------------------------------------------------------------------

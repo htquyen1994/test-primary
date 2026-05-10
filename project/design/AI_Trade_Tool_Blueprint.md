@@ -1,8 +1,8 @@
 # Blueprint: AI Semi-Auto Crypto Futures Trading Tool
 
-> **Phiên bản:** 1.1 *(cập nhật: Data Lag, Time Invalidation, VSA+Volume Profile, Slippage)*  
+> **Phiên bản:** 2.0 *(cập nhật: MTF Filter, BTC Spike Guard, Circuit Breaker, Dynamic Delta — Phase 9)*  
 > **Phong cách:** Semi-auto · Scalping · Crypto Futures  
-> **Khung giờ:** 15m (trigger) · 1H (context) · 5m (entry tinh chỉnh)  
+> **Khung giờ:** 15m (trigger) · 1H (context) · 4H + Daily (MTF bias) · 5m (entry tinh chỉnh)  
 > **Dữ liệu:** OHLCV + Order Book / Order Flow  
 
 ---
@@ -15,6 +15,21 @@
 | 2 | **Time Invalidation** thiếu | Thêm quy tắc hủy alert sau 10–15 nến chờ |
 | 3 | **VSA thiếu Volume Profile** | Thêm POC + Value Area Edge bonus (+10 pts) vào VSA module |
 | 4 | **Backtest thiếu phí/slippage** | Trừ 0.06–0.1% mỗi vòng lệnh, điều chỉnh target win rate |
+
+## Changelog v1.1 → v2.0 (Phase 9 — May 2026)
+
+| # | Vấn đề | Thay đổi |
+|---|---|---|
+| 1 | **Bug: ALERT khi OF=0** | Cap score tại 60 khi không có Order Book data |
+| 2 | **Bug: OB chỉ trả 1** | Trả về `List[OrderBlock]` (tối đa 3), ưu tiên Fib 61.8% > 50% > proximity |
+| 3 | **Bug: Confluence double-count** | POC bonus chỉ tính trong VSA module, max raw bonus = 45 (không phải 55) |
+| 4 | **MTF 4H Filter** | 3 kịch bản: Aligned/Diverging/Opposing với size multiplier |
+| 5 | **Circuit Breaker** | 4 triggers + smart unlock theo regime |
+| 6 | **BTC Spike Guard** | Cancel Alt alerts khi BTC move > 2%/15m |
+| 7 | **Dynamic Delta** | Threshold tự động theo `percentile_75(|delta_24h|) × 1.5` |
+| 8 | **Daily Bias** | EMA200/EMA50 trên Daily, BEAR + long signal → size × 0.75 |
+| 9 | **CORS security** | Explicit origins thay vì wildcard, `ALLOWED_ORIGINS` env var |
+| 10 | **ScoringService** | asyncio + threading (không dùng Celery), OHLCVService REST polling |
 
 ---
 
@@ -33,6 +48,7 @@
 11. [Lộ trình build](#11-lộ-trình-build)
 12. [Backtest & Tối ưu](#12-backtest--tối-ưu)
 13. [Cải tiến v1.1 — Nhận xét thực chiến](#13-cải-tiến-v11--nhận-xét-thực-chiến)
+14. [Phase 9 — Cải tiến v2.0](#14-phase-9--cải-tiến-v20)
 
 ---
 
@@ -55,14 +71,18 @@ Xây dựng công cụ AI hỗ trợ giao dịch crypto futures theo phong cách
 | Phong cách | Semi-auto scalping |
 | Khung trigger | 15 phút |
 | Khung context | 1 giờ |
+| Khung MTF filter | 4H + Daily *(v2.0)* |
 | Khung entry | 5 phút |
 | Tín hiệu mục tiêu/ngày | 5–12 |
 | Thời gian giữ lệnh TB | 15–60 phút |
 | R:R tối thiểu (gross) | 1.5 : 1 |
-| R:R tối thiểu (net sau phí) | 1.8 : 1 *(v1.1)* |
+| R:R tối thiểu (net sau phí) | 1.5 : 1 *(v1.1)* |
 | Score ngưỡng vào lệnh | ≥ 75 / 100 |
+| Score cap khi OB unavailable | ≤ 60 *(v2.0)* |
 | Đòn bẩy khuyến nghị | 3x – 10x |
 | Phí + slippage mỗi vòng | 0.06–0.1% *(v1.1)* |
+| Circuit Breaker triggers | 4 triggers *(v2.0)* |
+| BTC spike threshold | 2%/15m *(v2.0)* |
 
 ---
 
@@ -73,26 +93,42 @@ Xây dựng công cụ AI hỗ trợ giao dịch crypto futures theo phong cách
 │                     LAYER 1 — DATA INPUT                      │
 │  ┌──────────────┐   ┌──────────────┐   ┌───────────────────┐  │
 │  │  OHLCV Feed  │   │  Order Book  │   │  Funding / OI     │  │
-│  │ 1m/5m/15m/1H │   │ Bid/Ask/Tape │   │  Perpetual ctx    │  │
+│  │ 15m/1h/4h/1d │   │ Bid/Ask/Tape │   │  Perpetual ctx    │  │
+│  │ REST polling │   │ REST polling │   │  REST poll 8h     │  │
 │  └──────┬───────┘   └──────┬───────┘   └────────┬──────────┘  │
 └─────────┼──────────────────┼────────────────────┼─────────────┘
           └──────────────────▼────────────────────┘
-                             │ WebSocket ticks
+                             │ atomic writes
                              ▼
 ┌──────────────────────────────────────────────────────────────┐
-│              REDIS — LỚP ĐỆM TRUNG TÂM  (v1.1)               │
-│   delta:BTC:5m  |  ob:BTC:snap  |  ohlcv:BTC:15m  |  poc:BTC │
+│              REDIS — LỚP ĐỆM TRUNG TÂM  (v2.0)               │
+│   delta:{sym}:5m  |  ob:{sym}:snap  |  ohlcv:{sym}:{tf}      │
+│   poc:{sym}  |  regime:{sym}  |  funding:{sym}               │
+│   delta_history:{sym}  |  daily_bias:{sym}  |  btc_guard:spike│
+│   circuit_breaker:locked  |  alerts:channel  |  logs:channel  │
 └────────────┬──────────────────────────────┬──────────────────┘
              │                              │
-      Luồng 1 (asyncio)             Luồng 2 (Celery)
-      Delta Writer                  Signal Scorer
-      < 0.1ms/tick                  chạy khi nến đóng
-             │                              │
+      ScoringService                  OHLCVService
+      (asyncio + threading)           OrderBookService
+      candle_close pub/sub            DeltaService
+             │                        (asyncio.gather)
              └──────────────┬───────────────┘
                             ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                     LAYER 2 — AI ENGINE                       │
 │                                                               │
+│  [1] Regime Detector (ADX + ATR)                              │
+│       ↓                                                       │
+│  [2] MTF Bias Filter (4H + Daily)  ← Phase 9                 │
+│       Scenario A: size×1.0, +10pts                            │
+│       Scenario B: size×0.5, -10pts, warning                   │
+│       Scenario C: BLOCK → return early                        │
+│       ↓                                                       │
+│  [3] BTC Spike Guard (Alt symbols) ← Phase 9                 │
+│       Dump: cancel all Alt alerts → return early              │
+│       Pump: size×0.5                                          │
+│       ↓                                                       │
+│  [4] Signal Scoring                                           │
 │  ┌─────────────┐ ┌────────────┐ ┌────────────┐ ┌──────────┐  │
 │  │ Order Flow  │ │    SMC     │ │  VSA +     │ │ Context  │  │
 │  │  Analysis   │ │FVG+OB+CHoCH│ │Vol.Profile │ │  Filter  │  │
@@ -103,12 +139,15 @@ Xây dựng công cụ AI hỗ trợ giao dịch crypto futures theo phong cách
 │             ┌──────────────────────┐                           │
 │             │  Signal Score 0–100  │                           │
 │             │  + Confluence Bonus  │                           │
+│             │  + MTF adjustment    │  ← Phase 9               │
+│             │  data quality cap    │  ← Phase 9               │
 │             └──────────┬───────────┘                           │
 │                        ▼                                       │
 │     ┌──────────────────────────────────────┐                   │
 │     │           Alert Engine               │                   │
 │     │  score ≥ 75 → ALERT                 │                   │
 │     │  Time Invalidation: hủy sau 15 nến  │  ← v1.1           │
+│     │  Circuit Breaker: block CONFIRM      │  ← Phase 9       │
 │     └──────────────┬───────────────────────┘                   │
 └────────────────────┼─────────────────────────────────────────┘
                      ▼
@@ -117,7 +156,8 @@ Xây dựng công cụ AI hỗ trợ giao dịch crypto futures theo phong cách
 │  ┌──────────────┐  ┌──────────┐  ┌────────┐  ┌───────────┐   │
 │  │  Signal Card │  │ CONFIRM  │  │  SKIP  │  │  Journal  │   │
 │  │ Pair·Dir·Score│  │ 1 click  │  │ + Log  │  │ Auto log  │   │
-│  │ + Countdown  │  │          │  │        │  │ + Slippage│   │
+│  │ + MTF warning│  │ (CB check│  │        │  │ + Slippage│   │
+│  │ + Countdown  │  │  HTTP 423│  │        │  │           │   │
 │  └──────────────┘  └──────────┘  └────────┘  └───────────┘   │
 │                        ▼  feedback loop                        │
 │                   ┌──────────┐                                 │
@@ -134,12 +174,16 @@ Xây dựng công cụ AI hỗ trợ giao dịch crypto futures theo phong cách
 
 | Khung | Mục đích | Độ ưu tiên |
 |---|---|---|
+| Daily (1D) | Macro bias — EMA200/EMA50, BULL/BEAR/NEUTRAL | Cao (Phase 9) |
+| 4H | MTF filter — 4H bias A/B/C scenarios | Cao (Phase 9) |
 | 1H | HTF context, bias xác định xu hướng lớn | Cao |
 | 15m | MTF trigger, phát hiện setup chính | Cao |
 | 5m | LTF entry, tinh chỉnh điểm vào | Trung bình |
 | 1m | Xác nhận order flow tức thời | Thấp |
 
-**Nguồn dữ liệu:** Binance Futures WebSocket hoặc Bybit Linear Perpetual
+**Lưu ý v2.0:** 4H và Daily luôn được thêm vào timeframes bất kể config. BTC/USDT luôn được monitor bất kể config (cần cho BTC Spike Guard). Startup seed: 200 nến 4H + 250 nến Daily để warm up EMA200.
+
+**Nguồn dữ liệu:** REST polling qua ccxt (không phải WebSocket — xem Design Decision 9)
 
 ### 3.2 Kiến trúc xử lý realtime — Giải quyết Data Lag *(v1.1)*
 
@@ -222,15 +266,24 @@ Tổng tối đa: 125 điểm → normalize về 100
 
 | Điều kiện | Điểm |
 |---|---|
-| Delta dương > 1,000 BTC trong 5 nến gần nhất | +15 |
+| Delta dương > dynamic threshold trong 5 nến gần nhất | +15 |
 | Bid stack > Ask stack × 2 tại vùng S/R | +10 |
 | Absorption: volume cao nhưng giá không giảm | +10 |
 | **Tổng tối đa** | **35** |
 
+**Dynamic threshold (v2.0):**
+```
+threshold = percentile_75(|delta_24h|) × 1.5
+Fallback: 1000.0 nếu < 10 data points
+```
+
+**Data quality cap (v2.0):** Khi Order Book không có (bid_stack = ask_stack = 0), score bị cap tại 60 — không thể đạt ALERT.
+
 ```python
-def order_flow_score(delta, bid_stack, ask_stack, absorption):
+def order_flow_score(delta, bid_stack, ask_stack, absorption,
+                     delta_threshold=1000.0):
     score = 0
-    if delta > 1000:                  score += 15
+    if delta > delta_threshold:       score += 15  # dynamic threshold
     if bid_stack > ask_stack * 2:     score += 10
     if absorption:                    score += 10
     return score  # max 35
@@ -318,27 +371,68 @@ def vsa_volume_profile_score(pullback_vol, impulse_vol,
 ### 5.1 Signal Card — thông tin hiển thị
 
 ```
-┌──────────────────────────────────────────────┐
-│  🟢 BTC/USDT PERP — LONG          ⏱ 12:45  │
-│  Score: 88 / 100                             │
-│  ⚠️ Hết hạn sau: 14 nến 15m (210 phút)     │
-│──────────────────────────────────────────────│
-│  Entry:  $77,050  (OB midpoint + POC)        │
-│  SL:     $76,720  (dưới OB low 0.3%)        │
-│  TP1:    $77,800  (R:R gross 1.5)           │
-│  TP2:    $78,400  (FVG fill)                │
-│  Net R:R sau phí: ~1.38                     │
-│──────────────────────────────────────────────│
-│  Lý do:                                      │
-│  ✓ Bullish OB tại $76,850–$77,100           │
-│  ✓ Fib 61.8% = $77,028 (trong OB)          │
-│  ✓ POC ngày = $76,980 (trong OB)           │
-│  ✓ Delta +1,800 BTC — tổ chức mua          │
-│  ✓ Volume hồi = 38% impulse (No Supply)    │
-│  ✓ 1H bias: Bullish                         │
-│──────────────────────────────────────────────│
-│      [CONFIRM]          [SKIP]               │
-└──────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│  🟢 BTC/USDT PERP — LONG                  ⏱ 12:45  │
+│  Score: 88 / 100                                     │
+│  ⚠️ Hết hạn sau: 14 nến 15m (210 phút)             │
+│──────────────────────────────────────────────────────│
+│  Entry:  $77,050  (OB midpoint + POC)                │
+│  SL:     $76,720  (dưới OB low 0.3%)                │
+│  TP1:    $77,800  (R:R gross 1.5)                   │
+│  TP2:    $78,400  (FVG fill)                        │
+│  Net R:R sau phí: ~1.38                             │
+│  Size multiplier: 0.5× (MTF Scenario B)  ← v2.0    │
+│──────────────────────────────────────────────────────│
+│  Lý do:                                              │
+│  ✓ Bullish OB tại $76,850–$77,100                   │
+│  ✓ Fib 61.8% = $77,028 (trong OB)                  │
+│  ✓ POC ngày = $76,980 (trong OB)                   │
+│  ✓ Delta +1,800 BTC — tổ chức mua                  │
+│  ✓ Volume hồi = 38% impulse (No Supply)            │
+│  ✓ 1H bias: Bullish                                 │
+│──────────────────────────────────────────────────────│
+│  Phase 9 Context:                        ← v2.0    │
+│  4H bias: ranging  → Scenario B (size ×0.5)        │
+│  Daily bias: NEUTRAL                                │
+│  BTC Guard: inactive                                │
+│  ⚠️ 4H không xác nhận — size giảm 50%             │
+│──────────────────────────────────────────────────────│
+│      [CONFIRM]              [SKIP]                   │
+└──────────────────────────────────────────────────────┘
+```
+
+**Signal Card payload fields (v2.0):**
+```json
+{
+  "signal_id": "BTC/USDT_15m_1746835200",
+  "asset": "BTC/USDT",
+  "direction": "long",
+  "final_score": 88,
+  "classification": "ALERT",
+  "regime": "TRENDING",
+  "entry_price": 77050,
+  "stop_loss": 76720,
+  "take_profit_1": 77800,
+  "take_profit_2": 78400,
+  "gross_rr": 1.5,
+  "net_rr": 1.38,
+  "score_breakdown": {
+    "order_flow": 25, "smc": 20, "vsa": 20, "context": 12, "bonus": 8
+  },
+  "data_quality": {
+    "order_flow_available": true,
+    "order_book_available": true
+  },
+  "ob_warning": null,
+  "mtf_scenario": "B",
+  "mtf_warning": "4H không xác nhận — size giảm 50%",
+  "bias_4h": "ranging",
+  "daily_bias": "NEUTRAL",
+  "daily_warning": null,
+  "size_multiplier": 0.5,
+  "btc_guard_active": false,
+  "expires_at_candle": 115
+}
 ```
 
 ### 5.2 Luồng xác nhận
@@ -480,35 +574,11 @@ OB đơn thuần
 ### 8.2 Thuật toán detect
 
 ```python
-def find_order_block(candles, atr):
-    for i in range(1, len(candles) - 1):
-        impulse = abs(candles[i+1].close - candles[i+1].open)
-        if impulse >= 1.5 * atr:
-            if candles[i+1].is_bullish and candles[i].is_bearish:
-                return {
-                    'type':  'bullish',
-                    'high':  candles[i].high,
-                    'low':   candles[i].low,
-                    'mid':   (candles[i].high + candles[i].low) / 2,
-                    'valid': True
-                }
-    return None
-
-
-def calc_fibonacci(candles, lookback=50):
-    recent     = candles[-lookback:]
-    swing_high = max(c.high for c in recent)
-    swing_low  = min(c.low  for c in recent)
-    diff       = swing_high - swing_low
-    return {
-        '382': swing_high - 0.382 * diff,
-        '500': swing_high - 0.500 * diff,
-        '618': swing_high - 0.618 * diff,
-        '786': swing_high - 0.786 * diff,
-    }
-
-
-def confluence_bonus(ob, fib_levels, poc=None, fvg=None):
+def confluence_bonus(ob, fib_levels, fvg=None):
+    """
+    v2.0: POC đã được chuyển sang VSA module — không còn tính ở đây.
+    Max raw bonus = 45 (35 Fib + 10 FVG), normalize: bonus/45 × 15
+    """
     if not ob or not ob['valid']:
         return 0
 
@@ -516,7 +586,7 @@ def confluence_bonus(ob, fib_levels, poc=None, fvg=None):
     threshold = ob['mid'] * 0.005  # 0.5%
     fib_pts   = {'618': 35, '500': 25, '382': 15, '786': 10}
 
-    # Fib confluence
+    # Fib confluence (lấy level mạnh nhất)
     for level, pts in fib_pts.items():
         fib_price = fib_levels[level]
         if ob['low'] <= fib_price <= ob['high'] or \
@@ -524,28 +594,25 @@ def confluence_bonus(ob, fib_levels, poc=None, fvg=None):
             bonus += pts
             break
 
-    # POC confluence bonus (v1.1)
-    if poc and abs(poc - ob['mid']) <= threshold:
-        bonus += 10
-
-    # FVG triple confluence
+    # FVG confluence (+10 pts)
     if fvg and abs(fvg['mid'] - ob['mid']) <= threshold:
         bonus += 10
 
-    return bonus  # Max: 35 + 10 + 10 = 55 (normalize sau)
+    # Normalize: max raw = 45 → max normalized = 15
+    return min(bonus / 45 * 15, 15)
 ```
 
-### 8.3 Bảng điểm confluence
+### 8.3 Bảng điểm confluence (v2.0)
 
-| Tổ hợp | Bonus | Độ hiếm |
-|---|---|---|
-| OB đơn thuần | 0 | Rất phổ biến |
-| OB + Fib 38.2% | +15 | Khá thường |
-| OB + Fib 50% | +25 | Trung bình |
-| OB + Fib 61.8% | +35 | Ít thường |
-| OB + Fib 61.8% + POC | +45 | Hiếm *(v1.1)* |
-| OB + Fib 61.8% + FVG | +45 | Hiếm |
-| OB + Fib 61.8% + POC + FVG | +55 | Cực hiếm — Alert ngay |
+| Tổ hợp | Raw Bonus | Normalized | Độ hiếm |
+|---|---|---|---|
+| OB đơn thuần | 0 | 0 | Rất phổ biến |
+| OB + Fib 38.2% | +15 | 5.0 | Khá thường |
+| OB + Fib 50% | +25 | 8.3 | Trung bình |
+| OB + Fib 61.8% | +35 | 11.7 | Ít thường |
+| OB + Fib 61.8% + FVG | +45 | 15.0 | Hiếm — max bonus |
+
+> **v2.0 note:** POC không còn trong confluence bonus. POC chỉ tính trong VSA module (+10 pts khi entry ±0.3% của POC). Điều này tránh double-count khi OB + POC + Fib hội tụ.
 
 ### 8.4 Tính SL/TP từ confluence zone
 
@@ -658,147 +725,205 @@ def check_time_invalidation(alert, current_candle_index,
 
 ## 10. Tech Stack
 
-### 10.1 Backend (Python)
+### 10.1 Backend (Python) — v2.0
 
 ```
-backend/
-├── main.py                  # Entry point
+backend-workspace/
+├── main.py                      # Entry point — asyncio.gather(4 services)
+├── config.yaml                  # Single config file
+├── docker-compose.yml           # Redis only (Docker)
+│
 ├── data/
-│   ├── ws_ohlcv.py          # WebSocket OHLCV
-│   ├── ws_orderbook.py      # WebSocket Order Book
-│   ├── ws_trades.py         # WebSocket tick delta writer (v1.1)
-│   └── funding.py           # REST: funding rate, OI
-├── cache/
-│   ├── redis_writer.py      # Atomic tick → Redis (v1.1)
-│   └── redis_reader.py      # Đọc snapshot cho scorer
+│   ├── ohlcv_service.py         # OHLCVService — REST polling 15m/1h/4h/1d
+│   ├── orderbook_service.py     # OrderBookService — REST polling every 5s
+│   ├── delta_service.py         # DeltaService — trade tape polling + history
+│   └── funding.py               # Funding rate REST poll
+│
 ├── engine/
-│   ├── order_flow.py        # Module Order Flow
-│   ├── smc.py               # Module SMC: FVG, OB, CHoCH
-│   ├── vsa.py               # Module VSA (v1.1: + Volume Profile)
-│   ├── volume_profile.py    # POC/VAH/VAL calculator (v1.1)
-│   ├── context.py           # Module Context Filter
-│   ├── confluence.py        # Fib + OB + POC confluence (v1.1)
-│   └── scorer.py            # Signal Score aggregator
+│   ├── scoring_service.py       # ScoringService — asyncio + threading
+│   ├── scorer.py                # SignalScorer — normalize + classify
+│   ├── order_flow.py            # Order Flow module + dynamic threshold
+│   ├── smc.py                   # SMC: OB (List), FVG, CHoCH, HTF bias
+│   ├── vsa.py                   # VSA + Volume Profile
+│   ├── volume_profile.py        # POC/VAH/VAL calculator
+│   ├── context.py               # Context Filter (1H bias, funding, S/R)
+│   ├── confluence.py            # Fib + OB + FVG (POC removed v2.0)
+│   ├── regime_detector.py       # Regime: TRENDING/RANGING/PARABOLIC/CHOPPY
+│   ├── mtf_bias.py              # MTFBiasDetector — 4H + Daily (v2.0)
+│   ├── btc_guard.py             # BTCVolatilityGuard — spike detection (v2.0)
+│   ├── log_publisher.py         # Log entry builder + Redis publisher
+│   └── correlation_manager.py   # Pearson correlation + Portfolio Heat
+│
 ├── risk/
-│   ├── position_size.py     # Size lệnh (v1.1: tích hợp phí)
-│   ├── fee_calculator.py    # Phí + slippage estimate (v1.1)
-│   └── validator.py         # R:R net check, invalidation
+│   ├── circuit_breaker.py       # CircuitBreaker — 4 triggers (v2.0)
+│   ├── manager.py               # RiskManager — position sizing
+│   └── validator.py             # Risk limit enforcement
+│
+├── api/
+│   ├── main.py                  # FastAPI app + all endpoints
+│   ├── routes/
+│   │   └── config_routes.py     # Config management routes
+│   └── schemas.py               # Pydantic models
+│
+├── db/
+│   ├── migrations/
+│   │   ├── 001_initial_schema.sql
+│   │   ├── 002_config_tables.sql
+│   │   └── 003_circuit_breaker.sql  # v2.0
+│   ├── connection.py            # SQLAlchemy engine factory
+│   └── models.py                # ORM models
+│
+├── config/
+│   ├── config_system.py         # ConfigSystem — load/validate/hot-reload
+│   ├── config_service.py        # DB-based config (Group A/B)
+│   └── config_resolver.py       # DB + config.yaml merge
+│
 ├── alert/
-│   ├── builder.py           # Build Signal Card
-│   ├── invalidator.py       # Time-based invalidation (v1.1)
-│   └── sender.py            # Publish → Redis → Dashboard
+│   ├── builder.py               # Signal Card builder
+│   ├── invalidator.py           # Time-based invalidation
+│   └── sender.py                # Redis pub/sub sender
+│
 ├── trade/
-│   ├── executor.py          # Gửi lệnh qua exchange API
-│   └── journal.py           # Log kèm fee/slippage thực tế
-└── api/
-    └── routes.py            # FastAPI endpoints
+│   ├── executor.py              # Trade Executor (testnet mode)
+│   └── journal.py               # Trade Journal writer
+│
+└── backtest/
+    ├── engine.py
+    ├── metrics.py
+    └── benchmark.py
 ```
 
 ### 10.2 Thư viện chính
 
 | Thư viện | Dùng cho |
 |---|---|
-| `ccxt` | Kết nối exchange API |
-| `websockets` | Realtime data stream |
-| `pandas` + `numpy` | Tính toán OHLCV |
-| `ta-lib` | ATR, RSI, MACD |
-| `fastapi` | Backend API |
-| `celery` + `redis` | Task queue + cache *(v1.1 core)* |
-| `aioredis` | Async Redis cho WS writer |
-| `postgresql` | Trade journal lâu dài |
+| `ccxt` | REST polling exchange API (OHLCV, OB, trades) |
+| `pandas` + `numpy` | Tính toán OHLCV, indicators |
+| `fastapi` | Backend API + WebSocket |
+| `redis` + `aioredis` | Sync/async Redis client |
+| `sqlalchemy` | ORM cho SQL Server / SQLite |
+| `pydantic` | Config validation, request/response schemas |
+| `hypothesis` | Property-based testing |
+| `pytest` | Unit + integration tests |
 
-### 10.3 Infrastructure *(v1.1)*
+### 10.3 Infrastructure (v2.0)
 
 ```
-┌─────────────┐  WebSocket  ┌──────────────────────────────┐
-│  Binance /  │────────────►│  asyncio WS handlers         │
-│  Bybit API  │◄───REST─────│  (tick writer < 0.1ms)       │
-└─────────────┘             └──────────────┬───────────────┘
-                                           │ atomic write
-                                           ▼
-                             ┌─────────────────────────────┐
-                             │         REDIS               │
-                             │  delta · OB · OHLCV · POC   │
-                             └──────────────┬──────────────┘
-                                           │ read on candle close
-                                           ▼
-                             ┌─────────────────────────────┐
-                             │    Celery Worker(s)          │
-                             │    Signal Scoring Engine     │
-                             └──────────────┬──────────────┘
-                                           │ publish alert
-                                           ▼
-                             ┌─────────────────────────────┐
-                             │    FastAPI + WebSocket       │
-                             │    React Dashboard           │
-                             └──────────────┬──────────────┘
-                                           │
-                                           ▼
-                             ┌─────────────────────────────┐
-                             │    PostgreSQL                │
-                             │    Trade Journal             │
-                             └─────────────────────────────┘
+┌─────────────┐  REST polling  ┌──────────────────────────────┐
+│  Binance /  │───────────────►│  OHLCVService (asyncio)      │
+│  Bybit API  │  (public data) │  OrderBookService (asyncio)  │
+│  (public)   │                │  DeltaService (asyncio)      │
+└─────────────┘                └──────────────┬───────────────┘
+                                              │ atomic writes
+                                              ▼
+                               ┌─────────────────────────────┐
+                               │         REDIS (Docker)      │
+                               │  OHLCV · OB · Delta · POC   │
+                               │  delta_history · daily_bias  │
+                               │  btc_guard:spike · CB:locked │
+                               └──────────────┬──────────────┘
+                                              │ candle_close pub/sub
+                                              ▼
+                               ┌─────────────────────────────┐
+                               │  ScoringService             │
+                               │  (asyncio + threading)      │
+                               │  Phase 9 pipeline           │
+                               └──────────────┬──────────────┘
+                                              │ publish alert
+                                              ▼
+                               ┌─────────────────────────────┐
+                               │  FastAPI + WebSocket        │
+                               │  React Dashboard (:5173)    │
+                               └──────────────┬──────────────┘
+                                              │
+                                              ▼
+                               ┌─────────────────────────────┐
+                               │  SQL Server (:1433)         │
+                               │  signal_log · trade_journal │
+                               │  circuit_breaker_state      │
+                               └─────────────────────────────┘
+```
+
+**Startup sequence:**
+```
+1. docker-compose up -d                    # Redis only
+2. uvicorn api.main:app --reload --port 8000
+3. python main.py                          # 4 services via asyncio.gather
+4. npm run dev                             # Frontend :5173
 ```
 
 ### 10.4 Frontend Dashboard
 
 ```
-dashboard/
+frontend-workspace/src/
+├── pages/
+│   ├── SignalsPage.tsx           # Signal Cards (CONFIRM/SKIP)
+│   ├── LogsPage.tsx              # Real-time scoring log
+│   ├── JournalPage.tsx           # Trade history
+│   ├── AnalyticsPage.tsx         # Performance metrics
+│   └── config/
+│       ├── ExchangeConfigPage.tsx
+│       └── TradingParamsPage.tsx
 ├── components/
-│   ├── SignalCard.jsx        # Alert + countdown timer
-│   ├── ScoreBreakdown.jsx    # Chi tiết điểm từng module
-│   ├── FeeEstimate.jsx       # Net R:R sau phí (v1.1)
-│   ├── ConfirmButton.jsx     # Confirm / Skip
-│   ├── ChartView.jsx         # Chart với OB/FVG/Fib/POC
-│   └── JournalTable.jsx      # Lịch sử lệnh + net PnL
-└── pages/
-    ├── Dashboard.jsx
-    └── Analytics.jsx         # Win rate net, profit factor net
+│   ├── SignalCard.tsx            # Alert + MTF warning + countdown
+│   ├── ScoreBreakdown.tsx        # Per-module score bars
+│   ├── CircuitBreakerBanner.tsx  # CB status + unlock button (v2.0)
+│   ├── BTCGuardWarning.tsx       # BTC spike warning (v2.0)
+│   └── PortfolioHeader.tsx       # Portfolio Heat
+└── providers/
+    ├── AlertsWebSocketProvider.tsx
+    └── PortfolioWebSocketProvider.tsx
 ```
 
 ---
 
 ## 11. Lộ trình build
 
-### Giai đoạn 1 — MVP Rule-based (Tuần 1–3)
+### Giai đoạn 1 — MVP Rule-based ✅ HOÀN THÀNH
 
-- [ ] Kết nối Binance WebSocket: OHLCV 15m + tick trades
-- [ ] Redis setup: delta writer atomic
-- [ ] ATR(14) + swing high/low calculator
-- [ ] Detect Order Block cơ bản
-- [ ] Tính Fibonacci từ swing tự động
-- [ ] Confluence check OB + Fib
-- [ ] Signal Card terminal output
-- [ ] Log vào CSV (kèm estimated fee)
+- [x] Kết nối Binance REST: OHLCV 15m + order book
+- [x] Redis setup: ring buffer, pub/sub
+- [x] ATR(14), ADX(14), EMA indicators
+- [x] Detect Order Block, FVG, CHoCH
+- [x] Fibonacci levels
+- [x] Confluence check OB + Fib
+- [x] Signal Card + scoring engine (0–100)
+- [x] FastAPI + React dashboard
 
-**Deliverable:** Bot terminal, alert khi OB + Fib hội tụ, không block WS.
+### Giai đoạn 2 — Full AI Engine ✅ HOÀN THÀNH
 
-### Giai đoạn 2 — Full AI Engine (Tuần 4–6)
+- [x] ScoringService (asyncio + threading, không dùng Celery)
+- [x] Volume Profile calculator (POC/VAH/VAL)
+- [x] Order Flow delta score
+- [x] VSA + Volume Profile module (30 pts)
+- [x] Context filter (funding rate, 1H bias)
+- [x] Time-based Invalidation (15 nến timeout)
+- [x] Net R:R calculator (trừ 0.06–0.1% phí)
+- [x] Trade journal SQL Server
+- [x] Config management (DB-based, hot-reload)
 
-- [ ] Celery worker tách khỏi WS loop hoàn toàn
-- [ ] Volume Profile calculator (POC/VAH/VAL) → Redis
-- [ ] Order Flow delta score
-- [ ] FVG + CHoCH detector
-- [ ] VSA + Volume Profile module (30 pts)
-- [ ] Context filter (funding rate, 1H bias)
-- [ ] Time-based Invalidation (15 nến timeout)
-- [ ] Signal scoring engine (0–100, normalize)
-- [ ] Net R:R calculator (trừ 0.06–0.1% phí)
-- [ ] FastAPI + React dashboard: Signal Card + Confirm/Skip
-- [ ] Testnet execution: lệnh thật + auto SL/TP
-- [ ] Trade journal PostgreSQL (kèm slippage actual)
+### Giai đoạn 3 — Phase 9 Enhancements ✅ HOÀN THÀNH (May 2026)
 
-**Deliverable:** Hệ thống semi-auto hoàn chỉnh trên testnet.
+- [x] MTF 4H + Daily bias filter (3 scenarios A/B/C)
+- [x] BTC Volatility Spike Guard
+- [x] Circuit Breaker (4 triggers + smart unlock)
+- [x] Dynamic Delta Threshold (percentile_75 × 1.5)
+- [x] Daily bias size reduction (EMA200/EMA50)
+- [x] Data quality cap (score ≤ 60 khi OB unavailable)
+- [x] OB returns List[OrderBlock] (Fib-prioritized)
+- [x] Confluence POC double-count fix
+- [x] CORS security fix
 
-### Giai đoạn 3 — Tối ưu & ML (Tuần 7–12)
+### Giai đoạn 4 — Tối ưu & Live Trading (Kế hoạch)
 
-- [ ] Backtest engine với phí + slippage (0.08% default)
-- [ ] Phân tích journal: win rate net, profit factor net
+- [ ] Backtest engine với phí + slippage đầy đủ
+- [ ] Walk-forward analysis
 - [ ] A/B test ngưỡng score (70 vs 75 vs 80)
-- [ ] Tự động điều chỉnh trọng số module
-- [ ] Telegram alert backup
-- [ ] Multi-pair scanning (BTC, ETH, SOL)
+- [ ] WebSocket ingestion thay REST polling
+- [ ] USDT Dominance proxy (PENDING)
+- [ ] Multi-pair scanning mở rộng
 - [ ] ML layer: random forest phân loại win/loss
+- [ ] Live trading (sau khi testnet đạt ngưỡng)
 - [ ] Dashboard analytics: net metrics toàn bộ
 
 ---
@@ -977,19 +1102,183 @@ Net R:R = 0.18% / 0.43% = 0.42  ← THUA dù giá chạm TP!
 ### Điều kiện KHÔNG vào lệnh
 ```
 ✗ Score < 55
-✗ R:R gross < 1.5 HOẶC R:R net < 1.5  ← MỚI v1.1
-✗ TP < 4× tổng phí+slippage  ← MỚI v1.1
-✗ Alert đã chờ > 15 nến 15m (EXPIRED)  ← MỚI v1.1
+✗ R:R gross < 1.5 HOẶC R:R net < 1.5  ← v1.1
+✗ TP < 4× tổng phí+slippage  ← v1.1
+✗ Alert đã chờ > 15 nến 15m (EXPIRED)  ← v1.1
 ✗ Funding rate > ±0.1%
 ✗ Đang giữ ≥ 3 lệnh đồng thời
 ✗ Drawdown ngày đã đạt 5%
 ✗ Trong vòng 30 phút trước/sau CPI, FOMC, ...
 ✗ OB đã bị vi phạm (giá đóng cửa nến dưới OB low)
-✗ 1H bias đảo chiều sau khi alert được tạo  ← MỚI v1.1
+✗ 1H bias đảo chiều sau khi alert được tạo  ← v1.1
+✗ MTF Scenario C: 4H bias đối nghịch với signal  ← v2.0 (BLOCK)
+✗ BTC spike cooldown: trong 30 phút sau BTC dump  ← v2.0
+✗ Circuit Breaker locked (HTTP 423 khi CONFIRM)  ← v2.0
+✗ Order Book unavailable + score > 60  ← v2.0 (capped, không thể ALERT)
+✗ Daily bias BEAR + long signal + size multiplier < 0.5 (quá nhỏ)  ← v2.0
 ```
 
 ---
 
 *Blueprint này là tài liệu sống — cần cập nhật sau mỗi giai đoạn dựa trên kết quả thực tế.*
 
-*Phiên bản 1.1 · Tháng 5/2026 · Cập nhật dựa trên nhận xét thực chiến*
+*Phiên bản 2.0 · Tháng 5/2026 · Phase 9 — MTF Filter, BTC Guard, Circuit Breaker, Dynamic Delta*
+
+---
+
+## Phase 9 — Cải tiến v2.0 (May 2026)
+
+> Tất cả các tính năng trong Phase 9 đã được implement đầy đủ trong code.
+> Xem: `engine/mtf_bias.py`, `engine/btc_guard.py`, `risk/circuit_breaker.py`
+
+### Changelog v1.1 → v2.0
+
+| # | Vấn đề | Thay đổi |
+|---|---|---|
+| 1 | **Bug: ALERT khi OF=0** | Cap score tại 60 khi không có Order Book data |
+| 2 | **Bug: OB chỉ trả 1** | Trả về List[OrderBlock] (tối đa 3), ưu tiên Fib 61.8% > 50% > proximity |
+| 3 | **Bug: Confluence double-count** | POC bonus chỉ tính trong VSA module, max raw bonus = 45 (không phải 55) |
+| 4 | **MTF 4H Filter** | 3 kịch bản: Aligned/Diverging/Opposing với size multiplier |
+| 5 | **Circuit Breaker** | 4 triggers + smart unlock theo regime |
+| 6 | **BTC Spike Guard** | Cancel Alt alerts khi BTC move > 2%/15m |
+| 7 | **Dynamic Delta** | Threshold tự động theo percentile_75(|delta_24h|) × 1.5 |
+| 8 | **Daily Bias** | EMA200/EMA50 trên Daily, BEAR + long signal → size × 0.75 |
+| 9 | **CORS security** | Explicit origins thay vì wildcard, ALLOWED_ORIGINS env var |
+| 10 | **ScoringService** | asyncio + threading (không dùng Celery), OHLCVService REST polling |
+
+### Kiến trúc Timeframe Stack v2.0
+
+```
+Daily (1D)    → weekly_bias: BULL | BEAR | NEUTRAL
+                Macro filter — giảm 25% size khi BEAR
+    |
+4H            → 4h_bias: bullish | bearish | ranging
+                MTF filter — 3 kịch bản A/B/C
+    |
+1H            → context_bias: bullish | bearish | neutral
+                Context Filter (15 pts)
+    |
+15m           → trigger: signal generation
+                Entry timeframe
+```
+
+### Score Formula v2.0
+
+```
+raw = OF(35) + SMC(30) + VSA(30) + CTX(15) + Bonus(15)
+    + MTF_alignment_bonus(+10 nếu Scenario A)
+    - MTF_diverging_penalty(-10 nếu Scenario B)
+
+final = min(round(raw × regime_mult / 125 × 100), 100)
+
+Nếu OF data không có: final = min(final, 60)  ← không thể ALERT
+Nếu MTF Scenario C: BLOCK (không publish)
+
+Position size:
+  base_size × mtf_multiplier × daily_multiplier × btc_spike_multiplier
+```
+
+### MTF Alignment Matrix
+
+| 4H Bias  | 1H Bias  | Signal | Scenario | Size Mult | Score Adj | Ghi chú |
+|----------|----------|--------|----------|-----------|-----------|---------|
+| Bullish  | Bullish  | Long   | A        | 1.0       | +10       | Tất cả đồng thuận |
+| Bullish  | Bearish  | Short  | A        | 1.0       | +10       | Short theo 4H |
+| Bearish  | Bearish  | Short  | A        | 1.0       | +10       | Tất cả đồng thuận |
+| Ranging  | Bullish  | Long   | B        | 0.5       | -10       | 4H không xác nhận |
+| Ranging  | Bearish  | Short  | B        | 0.5       | -10       | 4H không xác nhận |
+| Bearish  | Bullish  | Long   | C        | 0.0       | BLOCK     | 4H đối nghịch |
+| Bullish  | Bearish  | Long   | C        | 0.0       | BLOCK     | 4H đối nghịch |
+
+**Điều kiện Scenario C:** 4H bias trực tiếp đối nghịch với signal direction (ADX > 25 implied by bias classification).
+
+### Circuit Breaker State Machine
+
+```
+UNLOCKED
+    │
+    │ Trigger 1: 3 consecutive losses in 24h → lock 12h
+    │ Trigger 2: single loss > 4% equity → lock 6h
+    │ Trigger 3: daily loss > 5% → lock until 00:00 UTC
+    │ Trigger 4: drawdown > 10% from 7-day peak → lock 24h + review
+    ▼
+LOCKED
+    │
+    │ Lock expires
+    ▼
+CHECK UNLOCK CONDITIONS
+    │
+    ├── Regime changed? → UNLOCKED (auto)
+    ├── Regime same? → extend 6h → LOCKED
+    └── Requires review (Trigger 4)? → wait for manual note → UNLOCKED
+```
+
+**State storage:**
+- SQL Server: `circuit_breaker_state` table (persistent)
+- Redis: `circuit_breaker:locked` key (fast-path cache, TTL = lock duration + 60s)
+- Pub/sub: `circuit_breaker:events` channel (lock/unlock/extend notifications)
+
+**API endpoints:**
+- `GET /api/circuit-breaker/status` — trạng thái hiện tại
+- `POST /api/circuit-breaker/unlock` — manual unlock với review_note (≥ 10 ký tự)
+
+### BTC Spike Guard Logic
+
+```
+Ngưỡng phát hiện: |close - open| / open > 2% trong 1 nến 15m
+
+BTC dump > 2%:
+  → Hủy TẤT CẢ Alt alerts (publish cancel_all_alerts)
+  → Reset delta tất cả Alt symbols
+  → Cooldown 30 phút (lưu vào btc_guard:spike Redis key)
+
+BTC pump > 2%:
+  → Giảm size 50% cho Alt long mới (size_multiplier = 0.5)
+  → Nếu Alt gain < 0.3× BTC gain → block hoàn toàn (relative weakness)
+  → Cooldown 30 phút
+
+Cooldown period (0–30 phút sau spike):
+  → Tất cả Alt alerts bị suppress (return early trong scoring cycle)
+  → Log reason: BTC_SPIKE_COOLDOWN
+  → BTC/USDT không bị ảnh hưởng (chỉ áp dụng cho Alt symbols)
+
+Pub/sub events:
+  btc_spike channel: thông báo direction, magnitude, cooldown_until
+  cancel_all_alerts channel: hủy tất cả Alt alerts khi dump
+```
+
+**Lưu ý triển khai:**
+- BTC/USDT luôn được monitor bất kể config (`OHLCVService` tự động thêm)
+- Spike check chạy trên mỗi BTC 15m candle close
+- `btc_guard:spike` Redis key có TTL = cooldown + 60s
+
+### Dynamic Delta Threshold
+
+```
+threshold = percentile_75(|delta_24h|) × 1.5
+Fallback: 1000.0 nếu < 10 data points
+
+Lưu lịch sử: delta_history:{symbol} (96 values = 24h × 15m candles)
+  → rpush mỗi candle close
+  → ltrim giữ 96 values gần nhất
+  → TTL: 25 giờ
+
+Ví dụ:
+  delta_history = [500, 800, 1200, 300, 2000, ...]  (96 values)
+  abs_deltas = [500, 800, 1200, 300, 2000, ...]
+  p75 = percentile_75(abs_deltas) = 1100
+  threshold = 1100 × 1.5 = 1650
+
+  → Ngày volume thấp: threshold thấp hơn → dễ trigger +15 pts
+  → Ngày volume cao: threshold cao hơn → chỉ tín hiệu thực sự mạnh mới trigger
+
+Sanity bounds: max(100.0, min(threshold, 50000.0))
+```
+
+**Log entry:** Mỗi scoring cycle log cả `delta` và `delta_threshold` để debug.
+
+---
+
+*Blueprint này là tài liệu sống — cần cập nhật sau mỗi giai đoạn dựa trên kết quả thực tế.*
+
+*Phiên bản 2.0 · Tháng 5/2026 · Phase 9 — MTF Filter, BTC Guard, Circuit Breaker, Dynamic Delta*

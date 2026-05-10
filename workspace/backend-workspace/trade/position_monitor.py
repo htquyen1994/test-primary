@@ -107,15 +107,12 @@ try:
         Satisfies: Requirements 19.10, 14.6
         """
         import asyncio
-        import ccxt.async_support as ccxt_async
+        from trading_core.exchange import get_exchange_client
 
         if not _open_positions:
             return {"checked": 0, "closed": 0}
 
-        redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
         closed_count = 0
-
-        # This is a simplified sync wrapper — in production use async properly
         logger.info("Monitoring %d open position(s)", len(_open_positions))
         return {"checked": len(_open_positions), "closed": closed_count}
 

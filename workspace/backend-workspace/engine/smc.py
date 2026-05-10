@@ -103,7 +103,8 @@ class CHoCH:
 class SMCResult:
     """Output of the SMC analysis for a single candle."""
     score: float = 0.0
-    order_block: Optional[OrderBlock] = None
+    order_block: Optional[OrderBlock] = None        # best OB (closest to price)
+    order_blocks: list = field(default_factory=list)  # all valid OBs (up to 3)
     fvg: Optional[FairValueGap] = None
     choch: Optional[CHoCH] = None
     htf_bias: str = "neutral"   # "bullish" | "bearish" | "neutral"
@@ -119,31 +120,48 @@ class SMCResult:
 def find_order_block(
     ohlcv: pd.DataFrame,
     atr_multiplier: float = OB_ATR_MULTIPLIER,
-) -> Optional[OrderBlock]:
+    max_obs: int = 3,
+) -> list:
     """
-    Identify the most recent valid Order Block.
+    Identify up to `max_obs` most recent valid Order Blocks.
 
     Algorithm:
     1. Scan backwards from the last candle
-    2. Find an impulse candle whose body >= atr_multiplier * ATR(14)
+    2. Find impulse candles whose body >= atr_multiplier * ATR(14)
     3. The OB is the last opposing candle immediately before the impulse
+    4. Return up to max_obs valid OBs, sorted by proximity to current price
+    5. Prioritize OBs that coincide with Fibonacci levels (61.8%, 50%)
 
     Bullish OB: bearish candle before a bullish impulse
     Bearish OB: bullish candle before a bearish impulse
 
-    Satisfies: Requirement 1.2 (OB mathematical logic)
+    Returns:
+        List[OrderBlock] — up to max_obs valid OBs, sorted by proximity to price.
+        Empty list if none found.
+
+    Satisfies: Requirement 1.2 (OB mathematical logic), Task 30.2
     """
     n = len(ohlcv)
     if n < 16:  # need at least ATR(14) + 2 candles
-        return None
+        return []
 
     atr_series = ATR().compute(ohlcv, period=14)
     atr_val = atr_series.iloc[-1]
     if np.isnan(atr_val) or atr_val == 0:
-        return None
+        return []
+
+    current_price = float(ohlcv.iloc[-1]["close"])
+
+    # Compute Fibonacci levels for prioritization
+    fib_levels = _compute_fib_levels(ohlcv)
+
+    found_obs: list = []
 
     # Scan backwards — skip last candle (still forming in live mode)
     for i in range(n - 2, 0, -1):
+        if len(found_obs) >= max_obs:
+            break
+
         impulse_candle = ohlcv.iloc[i + 1] if i + 1 < n else None
         if impulse_candle is None:
             continue
@@ -157,38 +175,71 @@ def find_order_block(
         ob_low = float(ob_candle["low"])
         ob_mid = (ob_high + ob_low) / 2.0
 
+        ob_type = None
         # Bullish impulse → bearish OB candle before it
         if (float(impulse_candle["close"]) > float(impulse_candle["open"]) and
                 float(ob_candle["close"]) < float(ob_candle["open"])):
-            ob = OrderBlock(
-                type="bullish",
-                high=ob_high,
-                low=ob_low,
-                mid=ob_mid,
-                candle_index=i,
-            )
-            # Validate: OB must not have been broken by subsequent candles
-            for j in range(i + 1, n):
-                ob.invalidate_if_broken(ohlcv.iloc[j])
-            if ob.valid:
-                return ob
-
+            ob_type = "bullish"
         # Bearish impulse → bullish OB candle before it
         elif (float(impulse_candle["close"]) < float(impulse_candle["open"]) and
               float(ob_candle["close"]) > float(ob_candle["open"])):
-            ob = OrderBlock(
-                type="bearish",
-                high=ob_high,
-                low=ob_low,
-                mid=ob_mid,
-                candle_index=i,
-            )
-            for j in range(i + 1, n):
-                ob.invalidate_if_broken(ohlcv.iloc[j])
-            if ob.valid:
-                return ob
+            ob_type = "bearish"
 
-    return None
+        if ob_type is None:
+            continue
+
+        ob = OrderBlock(
+            type=ob_type,
+            high=ob_high,
+            low=ob_low,
+            mid=ob_mid,
+            candle_index=i,
+        )
+        # Validate: OB must not have been broken by subsequent candles
+        for j in range(i + 1, n):
+            ob.invalidate_if_broken(ohlcv.iloc[j])
+
+        if ob.valid:
+            # Check Fibonacci confluence — prioritize OBs near 61.8% or 50%
+            ob_fib_score = _ob_fib_score(ob, fib_levels)
+            found_obs.append((ob, ob_fib_score))
+
+    if not found_obs:
+        return []
+
+    # Sort: Fibonacci-aligned OBs first, then by proximity to current price
+    found_obs.sort(key=lambda x: (-x[1], abs(x[0].mid - current_price)))
+    return [ob for ob, _ in found_obs]
+
+
+def _compute_fib_levels(ohlcv: pd.DataFrame, lookback: int = 50) -> dict:
+    """Compute Fibonacci retracement levels for OB prioritization."""
+    n = len(ohlcv)
+    if n < 4:
+        return {}
+    recent = ohlcv.iloc[-min(lookback, n):]
+    swing_high = float(recent["high"].max())
+    swing_low = float(recent["low"].min())
+    diff = swing_high - swing_low
+    if diff == 0:
+        return {}
+    return {
+        "618": swing_high - 0.618 * diff,
+        "500": swing_high - 0.500 * diff,
+        "382": swing_high - 0.382 * diff,
+    }
+
+
+def _ob_fib_score(ob: OrderBlock, fib_levels: dict) -> int:
+    """Return a priority score based on Fibonacci confluence (higher = better)."""
+    tolerance = ob.mid * 0.005  # 0.5%
+    if abs(ob.mid - fib_levels.get("618", -1)) <= tolerance:
+        return 3
+    if abs(ob.mid - fib_levels.get("500", -1)) <= tolerance:
+        return 2
+    if abs(ob.mid - fib_levels.get("382", -1)) <= tolerance:
+        return 1
+    return 0
 
 
 def find_fvg(ohlcv: pd.DataFrame) -> Optional[FairValueGap]:
@@ -398,12 +449,17 @@ def compute_smc_score(
         result.choch_aligned = True
         result.score += 10.0
 
-    # 3. Order Block retest
-    ob = find_order_block(ohlcv_15m, atr_multiplier)
-    result.order_block = ob
-    if ob and ob.valid and ob.is_price_retesting(current_price):
-        result.ob_retested = True
-        result.score += 10.0
+    # 3. Order Block retest — check all valid OBs, score the best match
+    obs = find_order_block(ohlcv_15m, atr_multiplier)
+    result.order_blocks = obs
+    # Best OB = first in list (sorted by Fib priority then proximity)
+    result.order_block = obs[0] if obs else None
+    for ob in obs:
+        if ob.valid and ob.is_price_retesting(current_price):
+            result.ob_retested = True
+            result.order_block = ob  # use the retesting OB as primary
+            result.score += 10.0
+            break  # score only once even if multiple OBs are retested
 
     # 4. FVG midpoint touch
     fvg = find_fvg(ohlcv_15m)
