@@ -1,0 +1,19 @@
+service:
+  host: "0.0.0.0"
+  port: 8001
+
+database:
+  url: "sqlite:///./mock_exchange.db"
+
+redis:
+  url: "redis://localhost:6379/0"
+
+exchange:
+  id: "binance"
+  fee_rate: 0.001
+
+mock_account:
+  initial_balance_usd: 10000.0
+
+price_feed:
+  ticker_poll_interval_seconds: 10
