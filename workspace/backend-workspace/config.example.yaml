@@ -27,7 +27,11 @@ risk:
   correlation_threshold: 0.8
   max_correlated_risk_pct: 3.0
   portfolio_heat_limit_pct: 6.0
-  atr_sl_multiplier: 1.5
+  # SL/TP parameters — configurable per user preference
+  atr_sl_multiplier: 1.5   # SL distance = ATR(14) x this value
+  tp1_rr: 2.0              # TP1 = SL distance x this value (gross R:R)
+  tp2_rr: 3.0              # TP2 = SL distance x this value (gross R:R)
+  min_net_rr: 1.5          # alerts suppressed when net R:R (after fees) < this
 
 strategy:
   active:

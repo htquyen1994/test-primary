@@ -19,6 +19,13 @@ from trading_core.cache import get_redis, RedisKeys
 
 logger = logging.getLogger(__name__)
 
+# ATR-based SL/TP — replaces hardcoded percentage offsets
+SL_ATR_MULT = 1.5          # SL distance = 1.5 × ATR(14)
+TP1_RR = 2.0               # Gross R:R target for TP1 (yields ~1.65 net after 0.2% fees at 1.5% SL)
+TP2_RR = 3.0               # Gross R:R target for TP2
+MIN_NET_RR = 1.5           # Minimum net R:R (after fees) required to publish an ALERT
+DEFAULT_FEE_RATE = 0.001   # 0.1% taker fee per fill (entry + exit = 0.2% round-trip)
+
 
 class ScoringService:
     """
@@ -26,8 +33,11 @@ class ScoringService:
     Runs in a background thread to avoid blocking the event loop.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, config=None) -> None:
         self._loop = None
+        self._config = config  # ConfigSystem instance; None → use module-level defaults
+        from engine.correlation_manager import CorrelationManager
+        self._correlation_manager = CorrelationManager()
 
     def _get_redis(self):
         return get_redis()
@@ -98,6 +108,10 @@ class ScoringService:
         raw_1h = r.lrange(RedisKeys.ohlcv(symbol, "1h"), 0, 99)
         ohlcv_1h = pd.DataFrame([json.loads(c) for c in reversed(raw_1h)]) if raw_1h else pd.DataFrame()
 
+        # Update correlation matrix with latest 1H closes (TASK-11)
+        if not ohlcv_1h.empty:
+            self._correlation_manager.update(symbol, ohlcv_1h)
+
         raw_4h = r.lrange(RedisKeys.ohlcv(symbol, "4h"), 0, 199)
         ohlcv_4h = pd.DataFrame([json.loads(c) for c in reversed(raw_4h)]) if raw_4h else pd.DataFrame()
 
@@ -114,16 +128,22 @@ class ScoringService:
         import time as _time
         updated_at = ob_data.get("updated_at", 0)
         ob_age = (_time.time() - updated_at) if updated_at else 999
-        if ob_age > 30:
-            logger.warning("OB data stale for %s (%.0fs old) — using with caution", symbol, ob_age)
 
-        # Task 30.4: detect when Order Book is completely unavailable
-        order_book_available = not (bid_stack == 0.0 and ask_stack == 0.0)
-        if not order_book_available:
+        _OB_STALE_THRESHOLD = 60  # seconds
+        if ob_age > _OB_STALE_THRESHOLD:
+            order_book_available = False
+            logger.warning(
+                "Order Book stale for %s (%.0fs old > %ds threshold) — capping score at 60",
+                symbol, ob_age, _OB_STALE_THRESHOLD,
+            )
+        elif bid_stack == 0.0 and ask_stack == 0.0:
+            order_book_available = False
             logger.warning(
                 "Order Book unavailable for %s — bid_stack=0 ask_stack=0 — score will be capped at 60",
                 symbol,
             )
+        else:
+            order_book_available = True
 
         delta = float(r.get(RedisKeys.delta(symbol)) or 0)
 
@@ -161,11 +181,46 @@ class ScoringService:
                 ohlcv_1h if not ohlcv_1h.empty else ohlcv, ohlcv
             )
 
-            signal_direction = "long"  # TODO: derive from CHoCH direction
-
             # --- Module scores (needed for filter context) ---
-            vp = compute_volume_profile(ohlcv)
-            smc = compute_smc_score(ohlcv, ohlcv_1h if not ohlcv_1h.empty else ohlcv)
+            vp = compute_volume_profile(ohlcv.iloc[-96:])
+
+            # Compute HTF bias once — reused by smc (both passes) and ctx
+            _ohlcv_1h_or_15m = ohlcv_1h if not ohlcv_1h.empty else ohlcv
+            from engine.smc import detect_htf_bias as _detect_htf_bias
+            htf_bias = _detect_htf_bias(_ohlcv_1h_or_15m) if not _ohlcv_1h_or_15m.empty else "neutral"
+
+            # Pass 1: detect CHoCH to derive signal direction (uses pre-computed htf_bias)
+            _smc_raw = compute_smc_score(ohlcv, _ohlcv_1h_or_15m, htf_bias=htf_bias)
+
+            # Derive signal direction from CHoCH + HTF bias.
+            # Short only when CHoCH breaks below a swing low (bearish)
+            # AND 1H trend is also bearish — dual confirmation prevents false shorts.
+            if (
+                _smc_raw.choch is not None
+                and _smc_raw.choch.direction == "bearish"
+                and _smc_raw.htf_bias == "bearish"
+            ):
+                signal_direction = "short"
+            else:
+                signal_direction = "long"
+
+            # Pass 2: rescore with direction-aware OB filter so bearish OBs are
+            # not awarded +10 pts for long signals (they are resistance, not support).
+            smc = compute_smc_score(ohlcv, _ohlcv_1h_or_15m, signal_direction=signal_direction, htf_bias=htf_bias)
+
+            # Compute nearest S/R distance from detected OB + FVG boundaries.
+            # Used by compute_context_score to award +3 pts when price is away from S/R.
+            _current_price = float(ohlcv.iloc[-1]["close"])
+            _sr_levels = []
+            for _ob in smc.order_blocks:
+                _sr_levels.extend([_ob.high, _ob.low])
+            if smc.fvg:
+                _sr_levels.extend([smc.fvg.top, smc.fvg.bot])
+            nearest_sr_distance_pct = (
+                min(abs(_current_price - lvl) for lvl in _sr_levels) / _current_price
+                if _sr_levels and _current_price > 0 else 0.0
+            )
+
             vsa = compute_vsa_score(ohlcv, vp, atr_val, delta)
 
             # --- Build filter context ---
@@ -232,19 +287,6 @@ class ScoringService:
             # Store daily bias in Redis for frontend (TTL 4h)
             daily_bias = detect_daily_bias(ohlcv_daily) if not ohlcv_daily.empty else "NEUTRAL"
             r.set(RedisKeys.daily_bias(symbol), daily_bias, ex=14400)
-            of = compute_order_flow_score(
-                delta=delta,
-                bid_stack=bid_stack,
-                ask_stack=ask_stack,
-                absorption=vsa.absorption or bid_dominant,
-                delta_threshold=dynamic_threshold,
-            )
-            ctx = compute_context_score(
-                ohlcv_1h if not ohlcv_1h.empty else ohlcv,
-                "long",
-                funding_rate,
-            )
-            bonus = compute_confluence_bonus(ohlcv, smc.order_blocks or smc.order_block, smc.fvg, vp.poc)
 
             # --- Module scores ---
             of = compute_order_flow_score(
@@ -256,8 +298,10 @@ class ScoringService:
             )
             ctx = compute_context_score(
                 ohlcv_1h if not ohlcv_1h.empty else ohlcv,
-                "long",
+                signal_direction,
                 funding_rate,
+                nearest_sr_distance_pct=nearest_sr_distance_pct,
+                htf_bias=htf_bias,
             )
             bonus = compute_confluence_bonus(ohlcv, smc.order_blocks or smc.order_block, smc.fvg, vp.poc)
 
@@ -324,28 +368,164 @@ class ScoringService:
             )
             publish_log(r, log_entry)
 
-            # --- Persist to SQL Server ---
-            self._persist_signal(symbol, timeframe, ohlcv, score, smc, vsa, of, ctx, bonus, regime_state, funding_rate)
-
-            # --- Publish ALERT ---
-            if score.classification == "ALERT":
-                self._publish_alert(
-                    r, symbol, timeframe, ohlcv, score, smc, vsa, of, ctx, bonus,
-                    regime_state, order_book_available,
-                    combined_size_mult=combined_size_mult,
-                    daily_bias=daily_bias,
-                    filter_warnings=filter_warnings,
+            # --- Compute ATR-based SL/TP (params from config or module defaults) ---
+            sl_atr_mult, tp1_rr, tp2_rr, min_net_rr, fee_rate = self._get_sl_tp_params()
+            close = float(ohlcv.iloc[-1]["close"])
+            if atr_val > 0:
+                stop_loss, tp1, tp2, gross_rr, net_rr = self._compute_sl_tp(
+                    close, atr_val, signal_direction,
+                    fee_rate=fee_rate,
+                    sl_atr_mult=sl_atr_mult,
+                    tp1_rr=tp1_rr,
+                    tp2_rr=tp2_rr,
                 )
+            else:
+                logger.warning(
+                    "ATR=0 for %s %s — cannot compute ATR-based SL/TP, ALERT suppressed",
+                    symbol, timeframe,
+                )
+                stop_loss = tp1 = tp2 = gross_rr = net_rr = 0.0
+
+            # --- Persist to SQL Server ---
+            self._persist_signal(
+                symbol, timeframe, ohlcv, score, smc, vsa, of, ctx, bonus,
+                regime_state, funding_rate,
+                stop_loss=stop_loss, tp1=tp1, tp2=tp2,
+                signal_direction=signal_direction,
+            )
+
+            # --- Publish ALERT (only when ATR is valid and R:R meets minimum) ---
+            if score.classification == "ALERT":
+                if atr_val == 0:
+                    logger.warning(
+                        "ALERT suppressed for %s %s: ATR=0 — no valid SL/TP",
+                        symbol, timeframe,
+                    )
+                elif net_rr < min_net_rr:
+                    logger.warning(
+                        "ALERT suppressed for %s %s: net R:R %.2f < %.1f minimum",
+                        symbol, timeframe, net_rr, min_net_rr,
+                    )
+                else:
+                    self._publish_alert(
+                        r, symbol, timeframe, ohlcv, score, smc, vsa, of, ctx, bonus,
+                        regime_state, order_book_available,
+                        combined_size_mult=combined_size_mult,
+                        daily_bias=daily_bias,
+                        filter_warnings=filter_warnings,
+                        stop_loss=stop_loss, tp1=tp1, tp2=tp2,
+                        gross_rr=gross_rr, net_rr=net_rr,
+                        signal_direction=signal_direction,
+                    )
 
         except Exception as exc:
             logger.error("Scoring error %s %s: %s", symbol, timeframe, exc, exc_info=True)
+
+    def _get_sl_tp_params(self) -> tuple:
+        """
+        Return (sl_atr_mult, tp1_rr, tp2_rr, min_net_rr, fee_rate).
+
+        Priority (DB > ConfigSystem > module constants):
+        1. DB TradingParams — authoritative, updated via FE without restart
+        2. ConfigSystem (config.yaml) — fallback when DB unavailable
+        3. Module-level constants — last resort (test environments)
+        """
+        # Fee rate from ExchangeSettings (Group B) or ConfigSystem fallback
+        fee_rate = DEFAULT_FEE_RATE
+        if self._config is not None:
+            try:
+                fee_rate = self._config.get().exchange.fee_rate
+            except Exception:
+                pass
+
+        # 1. Try DB TradingParams (primary — always reflects latest FE save)
+        try:
+            from db.connection import get_session_factory
+            from config.config_service import get_active_trading_params
+            db = get_session_factory()()
+            try:
+                tp = get_active_trading_params(db)
+            finally:
+                db.close()
+            return (
+                tp.get("atr_sl_multiplier", SL_ATR_MULT),
+                tp.get("tp1_rr_ratio", TP1_RR),
+                tp.get("tp2_rr_ratio", TP2_RR),
+                tp.get("min_net_rr", MIN_NET_RR),
+                fee_rate,
+            )
+        except Exception as exc:
+            logger.debug("_get_sl_tp_params: DB unavailable (%s), falling back", exc)
+
+        # 2. ConfigSystem (config.yaml)
+        if self._config is not None:
+            try:
+                cfg = self._config.get()
+                return (
+                    cfg.risk.atr_sl_multiplier,
+                    cfg.risk.tp1_rr,
+                    cfg.risk.tp2_rr,
+                    cfg.risk.min_net_rr,
+                    fee_rate,
+                )
+            except Exception:
+                pass
+
+        # 3. Module constants
+        return SL_ATR_MULT, TP1_RR, TP2_RR, MIN_NET_RR, fee_rate
 
     def _safe_last(self, series) -> float:
         """Return last non-NaN value from a pandas Series, or 0.0."""
         valid = series.dropna()
         return float(valid.iloc[-1]) if not valid.empty else 0.0
 
-    def _persist_signal(self, symbol, timeframe, ohlcv, score, smc, vsa, of, ctx, bonus, regime_state, funding_rate):
+    def _compute_sl_tp(
+        self,
+        entry: float,
+        atr: float,
+        direction: str,
+        fee_rate: float = DEFAULT_FEE_RATE,
+        sl_atr_mult: float = SL_ATR_MULT,
+        tp1_rr: float = TP1_RR,
+        tp2_rr: float = TP2_RR,
+    ) -> tuple:
+        """
+        Compute ATR-based stop loss, take profit levels, and net R:R.
+
+        SL  = entry ± sl_atr_mult × ATR(14)
+        TP1 = entry ± tp1_rr × SL_distance
+        TP2 = entry ± tp2_rr × SL_distance
+
+        Net R:R accounts for round-trip fee cost (entry + exit).
+
+        Returns:
+            (stop_loss, tp1, tp2, gross_rr, net_rr)
+        """
+        sl_dist = atr * sl_atr_mult
+        tp1_dist = sl_dist * tp1_rr
+        tp2_dist = sl_dist * tp2_rr
+
+        if direction == "long":
+            stop_loss = entry - sl_dist
+            tp1 = entry + tp1_dist
+            tp2 = entry + tp2_dist
+        else:  # short
+            stop_loss = entry + sl_dist
+            tp1 = entry - tp1_dist
+            tp2 = entry - tp2_dist
+
+        # Net R:R: deduct round-trip fee from both reward and risk
+        sl_pct = sl_dist / entry
+        tp1_pct = tp1_dist / entry
+        fee_total = fee_rate * 2  # entry + exit
+        net_rr = round(
+            (tp1_pct - fee_total) / (sl_pct + fee_total), 2
+        ) if (sl_pct + fee_total) > 0 else 0.0
+        gross_rr = round(tp1_rr, 2)
+
+        return round(stop_loss, 8), round(tp1, 8), round(tp2, 8), gross_rr, net_rr
+
+    def _persist_signal(self, symbol, timeframe, ohlcv, score, smc, vsa, of, ctx, bonus, regime_state, funding_rate, stop_loss, tp1, tp2, signal_direction="long"):
         """Persist signal to SQL Server signal_log table."""
         try:
             from db.connection import get_session_factory
@@ -355,13 +535,13 @@ class ScoringService:
             db = get_session_factory()()
             signal_obj = Signal(
                 strategy_name="scoring_engine",
-                asset=symbol, timeframe=timeframe, direction="long",
+                asset=symbol, timeframe=timeframe, direction=signal_direction,
                 candle_index=len(ohlcv) - 1,
                 candle_timestamp=datetime.now(timezone.utc),
                 entry_price=float(ohlcv.iloc[-1]["close"]),
-                stop_loss=float(ohlcv.iloc[-1]["close"]) * 0.98,
-                take_profit_1=float(ohlcv.iloc[-1]["close"]) * 1.03,
-                take_profit_2=float(ohlcv.iloc[-1]["close"]) * 1.05,
+                stop_loss=stop_loss,
+                take_profit_1=tp1,
+                take_profit_2=tp2,
                 raw_score=score.raw_score, final_score=score.final_score,
                 score_breakdown=ScoreBreakdown(
                     order_flow=of.score, smc=smc.score,
@@ -379,19 +559,19 @@ class ScoringService:
         except Exception as exc:
             logger.warning("Failed to persist signal_log: %s", exc)
 
-    def _publish_alert(self, r, symbol, timeframe, ohlcv, score, smc, vsa, of, ctx, bonus, regime_state, order_book_available=True, combined_size_mult=1.0, daily_bias="NEUTRAL", filter_warnings=None):
+    def _publish_alert(self, r, symbol, timeframe, ohlcv, score, smc, vsa, of, ctx, bonus, regime_state, order_book_available=True, combined_size_mult=1.0, daily_bias="NEUTRAL", filter_warnings=None, stop_loss=0.0, tp1=0.0, tp2=0.0, gross_rr=0.0, net_rr=0.0, signal_direction="long"):
         """Publish ALERT signal to Redis alerts:channel."""
         close = float(ohlcv.iloc[-1]["close"])
         r.publish(RedisKeys.Channels.ALERTS, json.dumps({
             "signal_id": f"{symbol}_{timeframe}_{int(time.time())}",
-            "asset": symbol, "timeframe": timeframe, "direction": "long",
+            "asset": symbol, "timeframe": timeframe, "direction": signal_direction,
             "final_score": score.final_score, "classification": "ALERT",
             "regime": regime_state.regime,
             "entry_price": close,
-            "stop_loss": close * 0.98,
-            "take_profit_1": close * 1.03,
-            "take_profit_2": close * 1.05,
-            "gross_rr": 1.5, "net_rr": 1.3,
+            "stop_loss": stop_loss,
+            "take_profit_1": tp1,
+            "take_profit_2": tp2,
+            "gross_rr": gross_rr, "net_rr": net_rr,
             "score_breakdown": {
                 "order_flow": of.score, "smc": smc.score,
                 "vsa": vsa.score, "context": ctx.score, "bonus": bonus,

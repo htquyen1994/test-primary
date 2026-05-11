@@ -91,6 +91,11 @@ class RedisKeys:
         """Recent loss timestamps for consecutive loss check."""
         return "circuit_breaker:recent_losses"
 
+    @staticmethod
+    def open_positions() -> str:
+        """Hash of open positions: {asset: risk_pct}. Used by portfolio heat."""
+        return "portfolio:open_positions"
+
     # ------------------------------------------------------------------
     # Pub/sub channels
     # ------------------------------------------------------------------

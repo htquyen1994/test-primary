@@ -61,8 +61,14 @@ class TestRiskManager:
         assert result.allowed is False
         assert "ATR" in result.rejection_reason
 
-    def test_leverage_applied_for_futures(self):
-        """Futures position size = spot size × leverage. Satisfies: Req 7.5"""
+    def test_notional_independent_of_leverage(self):
+        """
+        RiskManager returns NOTIONAL exposure — not margin.
+        Leverage does not affect the notional position size here.
+        The exchange applies leverage automatically based on account setting.
+        margin_required = notional / leverage  (handled by exchange, not RiskManager).
+        Satisfies: Req 7.5
+        """
         spot_manager = RiskManager(mode="fixed_usd", fixed_usd=100.0, max_risk_pct=0.10,
                                     leverage=1, market_type="spot")
         futures_manager = RiskManager(mode="fixed_usd", fixed_usd=100.0, max_risk_pct=0.10,
@@ -73,15 +79,16 @@ class TestRiskManager:
         futures_result = futures_manager.compute_position_size(
             "BTC/USDT", 50000.0, 49000.0, 10000.0, 500.0)
 
-        assert futures_result.position_size_usd == spot_result.position_size_usd * 5
+        # Both return the same notional — leverage is applied by the exchange
+        assert futures_result.position_size_usd == spot_result.position_size_usd
 
-    def test_leverage_not_applied_for_spot(self):
-        """Spot positions do not use leverage. Satisfies: Req 7.5"""
+    def test_fixed_usd_notional_not_multiplied_by_leverage(self):
+        """fixed_usd is a notional amount — leverage must not inflate it. Satisfies: Req 7.5"""
         manager = RiskManager(mode="fixed_usd", fixed_usd=100.0, max_risk_pct=0.10,
-                               leverage=10, market_type="spot")
+                               leverage=10, market_type="futures")
         result = manager.compute_position_size(
             "BTC/USDT", 50000.0, 49000.0, 10000.0, 500.0)
-        assert result.position_size_usd == 100.0  # leverage not applied
+        assert result.position_size_usd == 100.0  # notional unchanged regardless of leverage
 
     def test_max_risk_cap_enforced(self):
         """Max loss must not exceed equity × max_risk_pct. Satisfies: Req 7.3"""

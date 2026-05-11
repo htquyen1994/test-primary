@@ -4,6 +4,7 @@
  * Versioned — every save creates a new version in DB.
  */
 import { useEffect, useState } from 'react'
+import { apiFetch } from '../../lib/api'
 import type { TradingParams, ParamsVersionHistory } from '../../types/config'
 
 export function TradingParamsPage() {
@@ -39,7 +40,7 @@ export function TradingParamsPage() {
     setSaving(true)
     setSaveMsg(null)
     try {
-      const res = await fetch('/api/config/trading', {
+      const res = await apiFetch('/api/config/trading', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...params, version_tag: versionTag, version_note: versionNote }),
@@ -62,7 +63,7 @@ export function TradingParamsPage() {
   }
 
   async function handleActivateVersion(id: string, tag: string) {
-    const res = await fetch(`/api/config/trading/${id}/activate`, { method: 'POST' })
+    const res = await apiFetch(`/api/config/trading/${id}/activate`, { method: 'POST' })
     if (res.ok) {
       setSaveMsg(`✓ Rolled back to ${tag}`)
       fetch('/api/config/trading').then(r => r.json()).then(setParams)
@@ -166,11 +167,46 @@ export function TradingParamsPage() {
             onChange={v => setParams({ ...params, ob_atr_multiplier: v })} step={0.1} min={1} />
           <NumField label="Pinbar tail:body ratio" value={params.pinbar_tail_ratio}
             onChange={v => setParams({ ...params, pinbar_tail_ratio: v })} step={0.1} min={1.5} />
-          <NumField label="TP1 R:R ratio" value={params.tp1_rr_ratio}
-            onChange={v => setParams({ ...params, tp1_rr_ratio: v })} step={0.1} min={1} />
-          <NumField label="TP2 R:R ratio" value={params.tp2_rr_ratio}
-            onChange={v => setParams({ ...params, tp2_rr_ratio: v })} step={0.1} min={1} />
         </div>
+      </Section>
+
+      {/* SL / TP Settings */}
+      <Section title="SL / TP Settings">
+        <p className="text-xs text-gray-500 mb-3">
+          SL = ATR(14) × SL multiplier. TP1/TP2 = SL distance × R:R ratio.
+          Alerts are suppressed when net R:R (after round-trip fees) falls below the minimum.
+        </p>
+        <div className="grid grid-cols-2 gap-4">
+          <NumField
+            label="SL ATR multiplier (SL = ATR × this)"
+            value={params.atr_sl_multiplier}
+            onChange={v => setParams({ ...params, atr_sl_multiplier: v })}
+            step={0.1} min={0.5} max={5}
+          />
+          <NumField
+            label="Min net R:R after fees (alerts below this suppressed)"
+            value={params.min_net_rr}
+            onChange={v => setParams({ ...params, min_net_rr: v })}
+            step={0.1} min={0.5} max={5}
+          />
+          <NumField
+            label="TP1 gross R:R (e.g. 2.0 = 2× SL distance)"
+            value={params.tp1_rr_ratio}
+            onChange={v => setParams({ ...params, tp1_rr_ratio: v })}
+            step={0.1} min={1.1} max={10}
+          />
+          <NumField
+            label="TP2 gross R:R (e.g. 3.0 = 3× SL distance)"
+            value={params.tp2_rr_ratio}
+            onChange={v => setParams({ ...params, tp2_rr_ratio: v })}
+            step={0.1} min={1.2} max={15}
+          />
+        </div>
+        {params.tp1_rr_ratio >= params.tp2_rr_ratio && (
+          <p className="text-xs text-red-400 mt-2">
+            TP1 R:R must be less than TP2 R:R
+          </p>
+        )}
       </Section>
 
       {/* Risk */}

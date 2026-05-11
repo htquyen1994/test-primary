@@ -128,10 +128,12 @@ class TestOrderSubmission:
         assert result.success is False
         assert result.error is not None
 
-    def test_leverage_applied_for_futures(self):
+    def test_notional_not_multiplied_by_leverage_in_executor(self):
         """
-        Futures position size = base_size × leverage.
-        Satisfies: Requirement 19.4
+        TradeExecutor must NOT multiply position_size_usd by leverage.
+        position_size_usd is NOTIONAL exposure — the exchange applies leverage internally.
+        amount_contracts = notional / entry_price.
+        Satisfies: Requirements 19.4, 7.5
         """
         submitted_amounts = []
 
@@ -146,10 +148,10 @@ class TestOrderSubmission:
         executor = TradeExecutor(mock_exchange, make_config(testnet=False, leverage=5))
         run(executor.execute(SIGNAL_CARD, position_size_usd=100.0))
 
-        # With leverage=5, position_size = 100 * 5 = 500 USD
-        # amount = 500 / 50000 = 0.01 BTC
+        # Notional=100 USD, entry=50000 → amount = 100/50000 = 0.002 BTC
+        # Leverage (5×) is applied by the exchange, NOT here
         if submitted_amounts:
-            assert abs(submitted_amounts[0] - 0.01) < 1e-6
+            assert abs(submitted_amounts[0] - 0.002) < 1e-6
 
 
 class TestTradeJournal:

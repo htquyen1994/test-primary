@@ -32,8 +32,12 @@ export interface TradingParams {
   // Strategy thresholds
   ob_atr_multiplier: number
   pinbar_tail_ratio: number
-  tp1_rr_ratio: number
-  tp2_rr_ratio: number
+
+  // SL / TP settings (drives ScoringService — user-configurable)
+  atr_sl_multiplier: number   // SL = ATR × this (default 1.5)
+  tp1_rr_ratio: number        // TP1 gross R:R (default 2.0)
+  tp2_rr_ratio: number        // TP2 gross R:R (default 3.0)
+  min_net_rr: number          // minimum net R:R after fees (default 1.5)
 
   // Risk
   correlation_threshold: number

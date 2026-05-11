@@ -65,8 +65,9 @@ def detect_no_supply(ohlcv: pd.DataFrame, lookback: int = 5) -> bool:
         return False
 
     current_vol = float(ohlcv.iloc[-1]["volume"])
-    # Impulse volume = max volume in the lookback window (excluding current)
-    impulse_vol = float(ohlcv.iloc[-lookback - 1:-1]["volume"].max())
+    # Impulse volume = 75th percentile of lookback window — robust to outlier spikes
+    _vols = ohlcv.iloc[-lookback - 1:-1]["volume"].values
+    impulse_vol = float(np.percentile(_vols, 75))
 
     if impulse_vol == 0:
         return False

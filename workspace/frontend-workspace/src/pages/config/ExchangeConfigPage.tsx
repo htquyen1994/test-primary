@@ -6,6 +6,7 @@
  * Satisfies: Exchange config requirements
  */
 import { useEffect, useState } from 'react'
+import { apiFetch } from '../../lib/api'
 import type { ExchangeSettings, SupportedExchange, AssetConfig } from '../../types/config'
 
 const TIMEFRAMES = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '1d']
@@ -43,7 +44,7 @@ export function ExchangeConfigPage() {
     setSaving(true)
     setSaveMsg(null)
     try {
-      const res = await fetch('/api/config/exchange', {
+      const res = await apiFetch('/api/config/exchange', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(settings),

@@ -171,26 +171,26 @@ class TestConfluenceBonus:
 
     def test_no_ob_returns_zero(self):
         ohlcv = self._make_ohlcv()
-        bonus = compute_confluence_bonus(ohlcv, ob=None, fvg=None, poc=0.0)
+        bonus = compute_confluence_bonus(ohlcv, ob_or_obs=None, fvg=None, poc=0.0)
         assert bonus == 0.0
 
     def test_invalid_ob_returns_zero(self):
         ob = OrderBlock(type="bullish", high=101, low=99, mid=100, candle_index=5, valid=False)
         ohlcv = self._make_ohlcv()
-        bonus = compute_confluence_bonus(ohlcv, ob=ob, fvg=None, poc=0.0)
+        bonus = compute_confluence_bonus(ohlcv, ob_or_obs=ob, fvg=None, poc=0.0)
         assert bonus == 0.0
 
     def test_bonus_non_negative(self):
         ohlcv = self._make_ohlcv()
         ob = OrderBlock(type="bullish", high=101, low=99, mid=100, candle_index=5)
-        bonus = compute_confluence_bonus(ohlcv, ob=ob, fvg=None, poc=0.0)
+        bonus = compute_confluence_bonus(ohlcv, ob_or_obs=ob, fvg=None, poc=0.0)
         assert bonus >= 0.0
 
     def test_bonus_max_15(self):
         ohlcv = self._make_ohlcv()
         ob = OrderBlock(type="bullish", high=101, low=99, mid=100, candle_index=5)
         fvg = FairValueGap(type="bullish", top=101, bot=99, mid=100, candle_index=3)
-        bonus = compute_confluence_bonus(ohlcv, ob=ob, fvg=fvg, poc=100.0)
+        bonus = compute_confluence_bonus(ohlcv, ob_or_obs=ob, fvg=fvg, poc=100.0)
         assert bonus <= 15.0
 
     def test_fibonacci_levels_computed(self):

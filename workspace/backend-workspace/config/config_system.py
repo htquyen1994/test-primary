@@ -77,7 +77,23 @@ class RiskConfig(BaseModel):
     correlation_threshold: float = Field(default=0.8, gt=0, le=1.0)
     max_correlated_risk_pct: float = Field(default=3.0, gt=0)
     portfolio_heat_limit_pct: float = Field(default=6.0, gt=0)
-    atr_sl_multiplier: float = Field(default=1.5, gt=0)
+    # ATR-based SL/TP parameters (user-configurable via FE)
+    atr_sl_multiplier: float = Field(default=1.5, gt=0,
+                                     description="SL distance = ATR × this multiplier")
+    tp1_rr: float = Field(default=2.0, gt=1.0,
+                          description="TP1 gross R:R (e.g. 2.0 = 2× SL distance)")
+    tp2_rr: float = Field(default=3.0, gt=1.0,
+                          description="TP2 gross R:R (e.g. 3.0 = 3× SL distance)")
+    min_net_rr: float = Field(default=1.5, gt=0,
+                              description="Minimum net R:R after fees — alerts below this are suppressed")
+
+    @model_validator(mode="after")
+    def tp_rr_ordering(self) -> "RiskConfig":
+        if self.tp1_rr >= self.tp2_rr:
+            raise ValueError(
+                f"tp1_rr ({self.tp1_rr}) must be less than tp2_rr ({self.tp2_rr})"
+            )
+        return self
 
 
 class ScoreThresholdConfig(BaseModel):

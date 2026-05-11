@@ -68,7 +68,7 @@ class TradeExecutor:
             raise LiveTradingNotAllowedError(
                 "Live trading is disabled. "
                 "Set exchange.testnet = false in config.yaml to enable live trading. "
-                "Current value: testnet={testnet!r}"
+                f"Current value: testnet={testnet!r}"
             )
 
     async def execute(
@@ -96,12 +96,10 @@ class TradeExecutor:
         entry_price = signal_card["entry_price"]
         stop_loss = signal_card["stop_loss"]
         tp1 = signal_card["take_profit_1"]
-        leverage = getattr(self._config.exchange, "leverage", 1)
 
-        # Apply leverage for futures
-        market_type = getattr(self._config.exchange, "market_type", "spot")
-        if market_type == "futures":
-            position_size_usd *= leverage
+        # position_size_usd is already the NOTIONAL exposure from RiskManager.
+        # Do NOT multiply by leverage here — the exchange applies it automatically.
+        # amount_contracts = notional / entry_price is the correct order quantity.
 
         # Submit entry order with retry (Req 19.7)
         entry_result = await self._submit_with_retry(

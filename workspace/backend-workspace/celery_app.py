@@ -25,6 +25,7 @@ app = Celery(
     backend=REDIS_URL,
     include=[
         "engine.tasks",   # signal scoring tasks (Task 13)
+        "trade.tasks",    # trade execution tasks (Task 04)
     ],
 )
 

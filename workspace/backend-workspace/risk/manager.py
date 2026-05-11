@@ -14,6 +14,14 @@ Risk limits enforced:
   - Portfolio heat ≤ portfolio_heat_limit_pct
   - ATR = 0 → reject signal
 
+LEVERAGE NOTE:
+  position_size_usd returned here is the NOTIONAL exposure (not margin).
+  For futures: notional = equity × risk_pct / SL%
+  The exchange applies leverage automatically based on account leverage setting.
+  margin_required = notional / leverage  (handled by exchange, not here).
+  TradeExecutor converts: amount_contracts = notional / entry_price.
+  Do NOT multiply by leverage here or in the executor.
+
 Satisfies: Requirements 7.1–7.5, 14.3–14.7
 """
 
@@ -165,9 +173,9 @@ class RiskManager:
         # Actual risk as fraction of equity
         actual_risk_pct = (position_usd * sl_pct) / account_equity
 
-        # --- Apply leverage for Futures (Req 7.5) ---
-        if self.market_type == "futures":
-            position_usd *= self.leverage
+        # NOTE: No leverage multiplication here.
+        # position_usd is the NOTIONAL exposure. The exchange applies leverage
+        # automatically. Multiplying here would compound leverage (e.g. 10x→100x).
 
         # --- Correlated risk check (Req 14.3–14.7) ---
         if self.correlation_manager is not None:

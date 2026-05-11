@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Optional
 
 import pandas as pd
 
@@ -41,6 +42,7 @@ def compute_context_score(
     signal_direction: str,
     funding_rate: float,
     nearest_sr_distance_pct: float = 0.0,
+    htf_bias: Optional[str] = None,
 ) -> ContextResult:
     """
     Compute the Context Filter module score (max 15 pts).
@@ -58,8 +60,13 @@ def compute_context_score(
     """
     result = ContextResult()
 
-    # 1. HTF bias alignment (+8 pts)
-    if not ohlcv_1h.empty:
+    # 1. HTF bias alignment (+8 pts) — use pre-computed value if provided
+    if htf_bias is not None:
+        result.htf_bias = htf_bias
+        if _bias_aligned(signal_direction, result.htf_bias):
+            result.htf_bias_aligned = True
+            result.score += 8.0
+    elif not ohlcv_1h.empty:
         result.htf_bias = detect_htf_bias(ohlcv_1h)
         if _bias_aligned(signal_direction, result.htf_bias):
             result.htf_bias_aligned = True

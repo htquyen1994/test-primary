@@ -45,8 +45,15 @@ class TestCorrelationMatrix:
 
     def test_opposite_series_correlation_is_minus_one(self):
         manager = CorrelationManager()
-        closes_a = [100 + i for i in range(30)]
-        closes_b = [100 - i for i in range(30)]
+        # Build prices where each log-return of B = -log-return of A.
+        # This gives exact -1 Pearson correlation on log returns.
+        np.random.seed(42)
+        log_rets = np.random.normal(0.005, 0.002, 29)
+        closes_a = [100.0]
+        closes_b = [100.0]
+        for lr in log_rets:
+            closes_a.append(closes_a[-1] * np.exp(lr))
+            closes_b.append(closes_b[-1] * np.exp(-lr))
         manager.update("BTC/USDT", make_ohlcv_1h(closes_a))
         manager.update("ETH/USDT", make_ohlcv_1h(closes_b))
 

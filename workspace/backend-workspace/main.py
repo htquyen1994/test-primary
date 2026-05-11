@@ -90,7 +90,7 @@ async def main():
     ohlcv_svc = OHLCVService(exchange_id, assets, timeframes)
     ob_svc = OrderBookService(exchange_id, assets)
     delta_svc = DeltaService(exchange_id, assets)
-    scoring_svc = ScoringService()
+    scoring_svc = ScoringService(config=cfg)
 
     logger.info("Starting all services...")
     await asyncio.gather(

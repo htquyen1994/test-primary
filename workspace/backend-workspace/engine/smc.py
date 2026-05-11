@@ -158,7 +158,8 @@ def find_order_block(
     found_obs: list = []
 
     # Scan backwards — skip last candle (still forming in live mode)
-    for i in range(n - 2, 0, -1):
+    # Limit to last 100 candles to keep O(n) instead of O(n²)
+    for i in range(n - 2, max(0, n - 102), -1):
         if len(found_obs) >= max_obs:
             break
 
@@ -213,13 +214,41 @@ def find_order_block(
 
 
 def _compute_fib_levels(ohlcv: pd.DataFrame, lookback: int = 50) -> dict:
-    """Compute Fibonacci retracement levels for OB prioritization."""
+    """
+    Compute Fibonacci retracement levels for OB prioritization.
+
+    Uses pivot highs/lows (local extremes) rather than absolute max/min to
+    avoid spurious Fibonacci levels from isolated wicks far from price structure.
+    Falls back to absolute extremes if not enough pivots are detected.
+    """
     n = len(ohlcv)
     if n < 4:
         return {}
     recent = ohlcv.iloc[-min(lookback, n):]
-    swing_high = float(recent["high"].max())
-    swing_low = float(recent["low"].min())
+    nr = len(recent)
+
+    # Detect pivot highs and lows (requires 2-bar confirmation on each side)
+    _highs = recent["high"].values.astype(float)
+    _lows = recent["low"].values.astype(float)
+    pivot_highs = [
+        _highs[i] for i in range(2, nr - 2)
+        if _highs[i] > _highs[i - 1] and _highs[i] > _highs[i - 2]
+        and _highs[i] > _highs[i + 1] and _highs[i] > _highs[i + 2]
+    ]
+    pivot_lows = [
+        _lows[i] for i in range(2, nr - 2)
+        if _lows[i] < _lows[i - 1] and _lows[i] < _lows[i - 2]
+        and _lows[i] < _lows[i + 1] and _lows[i] < _lows[i + 2]
+    ]
+
+    if pivot_highs and pivot_lows:
+        swing_high = max(pivot_highs)
+        swing_low = min(pivot_lows)
+    else:
+        # Fallback: absolute extremes when pivots are insufficient
+        swing_high = float(recent["high"].max())
+        swing_low = float(recent["low"].min())
+
     diff = swing_high - swing_low
     if diff == 0:
         return {}
@@ -379,16 +408,17 @@ def detect_choch(ohlcv: pd.DataFrame, lookback: int = SWING_LOOKBACK) -> Optiona
     last_close = float(last_candle["close"])
     last_idx = n - 1
 
-    # Bullish CHoCH: close breaks above swing high
-    if last_close > swing_high:
+    # Bullish CHoCH: close breaks above swing high with 0.1% momentum buffer
+    # Prevents false signals from candles that barely graze the swing level.
+    if last_close > swing_high * (1 + 0.001):
         return CHoCH(
             direction="bullish",
             break_price=swing_high,
             candle_index=last_idx,
         )
 
-    # Bearish CHoCH: close breaks below swing low
-    if last_close < swing_low:
+    # Bearish CHoCH: close breaks below swing low with 0.1% momentum buffer
+    if last_close < swing_low * (1 - 0.001):
         return CHoCH(
             direction="bearish",
             break_price=swing_low,
@@ -413,19 +443,24 @@ def compute_smc_score(
     ohlcv_15m: pd.DataFrame,
     ohlcv_1h: pd.DataFrame,
     atr_multiplier: float = OB_ATR_MULTIPLIER,
+    signal_direction: str = "long",
+    htf_bias: Optional[str] = None,
 ) -> SMCResult:
     """
     Compute the SMC module score (max 30 pts).
 
     Scoring:
         CHoCH aligned with 1H bias:  +10 pts
-        Order Block retest:          +10 pts
+        Order Block retest:          +10 pts  (only OBs aligned with signal_direction)
         FVG midpoint touched:        +10 pts
 
     Args:
-        ohlcv_15m: 15-minute OHLCV DataFrame (trigger timeframe)
-        ohlcv_1h:  1-hour OHLCV DataFrame (context timeframe)
-        atr_multiplier: Minimum impulse body as multiple of ATR
+        ohlcv_15m:        15-minute OHLCV DataFrame (trigger timeframe)
+        ohlcv_1h:         1-hour OHLCV DataFrame (context timeframe)
+        atr_multiplier:   Minimum impulse body as multiple of ATR
+        signal_direction: "long" or "short" — only matching OBs are scored.
+                          Bullish OBs act as support for longs;
+                          Bearish OBs act as resistance for shorts.
 
     Returns:
         SMCResult with score and detected patterns
@@ -439,8 +474,10 @@ def compute_smc_score(
 
     current_price = float(ohlcv_15m.iloc[-1]["close"])
 
-    # 1. HTF bias
-    result.htf_bias = detect_htf_bias(ohlcv_1h) if not ohlcv_1h.empty else "neutral"
+    # 1. HTF bias — use caller-provided value to avoid recomputing when already known
+    result.htf_bias = htf_bias if htf_bias is not None else (
+        detect_htf_bias(ohlcv_1h) if not ohlcv_1h.empty else "neutral"
+    )
 
     # 2. CHoCH detection
     choch = detect_choch(ohlcv_15m)
@@ -449,13 +486,16 @@ def compute_smc_score(
         result.choch_aligned = True
         result.score += 10.0
 
-    # 3. Order Block retest — check all valid OBs, score the best match
+    # 3. Order Block retest — only score OBs that align with signal direction.
+    #    Bullish OB = demand zone (support) → valid for long signals only.
+    #    Bearish OB = supply zone (resistance) → valid for short signals only.
+    expected_ob_type = "bullish" if signal_direction == "long" else "bearish"
     obs = find_order_block(ohlcv_15m, atr_multiplier)
     result.order_blocks = obs
     # Best OB = first in list (sorted by Fib priority then proximity)
     result.order_block = obs[0] if obs else None
     for ob in obs:
-        if ob.valid and ob.is_price_retesting(current_price):
+        if ob.valid and ob.is_price_retesting(current_price) and ob.type == expected_ob_type:
             result.ob_retested = True
             result.order_block = ob  # use the retesting OB as primary
             result.score += 10.0

@@ -102,27 +102,28 @@ class TestOrderBlock:
 
     def test_detects_bullish_ob(self):
         ohlcv = bullish_impulse_ohlcv()
-        ob = find_order_block(ohlcv)
-        assert ob is not None
-        assert ob.type == "bullish"
-        assert ob.valid is True
+        obs = find_order_block(ohlcv)
+        assert obs  # non-empty list
+        assert obs[0].type == "bullish"
+        assert obs[0].valid is True
 
     def test_detects_bearish_ob(self):
         ohlcv = bearish_impulse_ohlcv()
-        ob = find_order_block(ohlcv)
-        assert ob is not None
-        assert ob.type == "bearish"
-        assert ob.valid is True
+        obs = find_order_block(ohlcv)
+        assert obs
+        assert obs[0].type == "bearish"
+        assert obs[0].valid is True
 
     def test_returns_none_for_flat_market(self):
         ohlcv = flat_ohlcv(30)
-        ob = find_order_block(ohlcv)
-        assert ob is None
+        obs = find_order_block(ohlcv)
+        assert not obs  # empty list
 
     def test_ob_mid_is_average_of_high_low(self):
         ohlcv = bullish_impulse_ohlcv()
-        ob = find_order_block(ohlcv)
-        assert ob is not None
+        obs = find_order_block(ohlcv)
+        assert obs
+        ob = obs[0]
         assert abs(ob.mid - (ob.high + ob.low) / 2) < 1e-10
 
     def test_ob_invalidated_when_price_closes_below_low(self):
@@ -147,8 +148,8 @@ class TestOrderBlock:
 
     def test_returns_none_for_insufficient_data(self):
         ohlcv = flat_ohlcv(5)
-        ob = find_order_block(ohlcv)
-        assert ob is None
+        obs = find_order_block(ohlcv)
+        assert not obs  # empty list
 
 
 # ---------------------------------------------------------------------------

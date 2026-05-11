@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from api.auth import require_api_key
 from db.connection import get_session
 from config.config_service import (
     get_active_trading_params,
@@ -75,8 +76,11 @@ class TradingParamsSaveRequest(BaseModel):
     # Strategy
     ob_atr_multiplier: float = Field(1.5, gt=0)
     pinbar_tail_ratio: float = Field(2.0, gt=1.0)
-    tp1_rr_ratio: float = Field(1.5, gt=0)
-    tp2_rr_ratio: float = Field(2.5, gt=0)
+    # SL/TP — user-configurable; ScoringService reads these from DB
+    atr_sl_multiplier: float = Field(1.5, gt=0, description="SL = ATR x this multiplier")
+    tp1_rr_ratio: float = Field(2.0, gt=1.0, description="TP1 gross R:R (e.g. 2.0 = 2x SL)")
+    tp2_rr_ratio: float = Field(3.0, gt=1.0, description="TP2 gross R:R (e.g. 3.0 = 3x SL)")
+    min_net_rr: float = Field(1.5, gt=0, description="ALERT suppressed when net R:R < this")
     # Risk
     correlation_threshold: float = Field(0.8, gt=0, le=1.0)
     max_correlated_risk_pct: float = Field(3.0, gt=0)
@@ -127,6 +131,7 @@ def get_trading_params(db: Session = Depends(get_session)):
 def update_trading_params(
     body: TradingParamsSaveRequest,
     db: Session = Depends(get_session),
+    _: None = Depends(require_api_key),
 ):
     """
     Save a new version of trading parameters.
@@ -148,7 +153,7 @@ def get_params_history(limit: int = 20, db: Session = Depends(get_session)):
 
 
 @router.post("/trading/{version_id}/activate")
-def activate_params_version(version_id: str, db: Session = Depends(get_session)):
+def activate_params_version(version_id: str, db: Session = Depends(get_session), _: None = Depends(require_api_key)):
     """Rollback to a previous version of trading parameters."""
     success = activate_trading_params_version(version_id, db)
     if not success:
@@ -173,6 +178,7 @@ def get_exchange_settings(db: Session = Depends(get_session)):
 def update_exchange_settings(
     body: ExchangeSettingsSaveRequest,
     db: Session = Depends(get_session),
+    _: None = Depends(require_api_key),
 ):
     """
     Save exchange settings.

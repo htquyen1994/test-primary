@@ -87,6 +87,14 @@ class BacktestingEngine:
         # Sort ascending — enforce chronological order (Req 8.6)
         ohlcv = ohlcv.sort_index()
 
+        # Derive candle duration so funding interval is correct for any timeframe.
+        # FUNDING_INTERVAL_HOURS=8 means 8h / candle_duration = N candles per payment.
+        try:
+            _tf_seconds = (ohlcv.index[1] - ohlcv.index[0]).total_seconds()
+            self._timeframe_minutes = max(1, int(_tf_seconds / 60))
+        except Exception:
+            self._timeframe_minutes = 15  # safe default
+
         results: List[TradeResult] = []
         open_trade: Optional[TradeResult] = None
         equity = self.initial_equity
@@ -255,8 +263,10 @@ class BacktestingEngine:
         """Simplified funding rate payment calculation."""
         if funding_rates.empty:
             return 0.0
-        # Apply funding every FUNDING_INTERVAL_HOURS candles (approximate)
-        if candle_idx % FUNDING_INTERVAL_HOURS == 0:
+        # Convert 8h funding interval to candle count based on actual timeframe
+        _tf_min = getattr(self, "_timeframe_minutes", 15)
+        _funding_candles = max(1, int((FUNDING_INTERVAL_HOURS * 60) / _tf_min))
+        if candle_idx % _funding_candles == 0:
             rate = float(funding_rates.iloc[min(candle_idx, len(funding_rates) - 1)].get("rate", 0.0))
             return abs(rate) * trade.position_size_usd
         return 0.0

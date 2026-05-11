@@ -98,8 +98,11 @@ class SMCOrderBlockFVGStrategy(BaseStrategy):
             return []  # no clear bias — skip
 
         # --- Order Block detection ---
-        ob = find_order_block(ohlcv)
-        if ob is None or not ob.valid:
+        obs = find_order_block(ohlcv)
+        if not obs:
+            return []
+        ob = obs[0]
+        if not ob.valid:
             return []
 
         # --- OB must be retesting ---
@@ -122,7 +125,7 @@ class SMCOrderBlockFVGStrategy(BaseStrategy):
         smc_result = compute_smc_score(ohlcv, ohlcv_1h)
         ctx_result = compute_context_score(ohlcv_1h, direction, funding_rate)
         fvg = find_fvg(ohlcv)
-        bonus = compute_confluence_bonus(ohlcv, ob=ob, fvg=fvg, poc=poc)
+        bonus = compute_confluence_bonus(ohlcv, ob, fvg=fvg, poc=poc)
 
         # Order flow (simplified — use delta as proxy)
         of_score = min(15.0, abs(delta) / 100.0) if delta != 0 else 0.0

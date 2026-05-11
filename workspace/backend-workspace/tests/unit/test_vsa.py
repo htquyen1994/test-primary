@@ -110,8 +110,9 @@ class TestVolumeProfile:
 class TestVSASignals:
 
     def test_no_supply_detected_when_pullback_vol_low(self):
-        # Impulse vol = 5000, current vol = 1500 → ratio = 0.30 < 0.40
-        volumes = [1000, 1000, 1000, 1000, 5000, 1500]
+        # 75th-percentile impulse vol ≈ 5000, current vol = 1500 → ratio = 0.30 < 0.40
+        # Lookback volumes are uniformly high so the 75th-pct reflects typical vol.
+        volumes = [4000, 5000, 4500, 5000, 4800, 1500]
         ohlcv = make_ohlcv_with_volumes(volumes)
         assert detect_no_supply(ohlcv) is True
 

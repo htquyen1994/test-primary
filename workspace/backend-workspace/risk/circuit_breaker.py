@@ -221,7 +221,7 @@ class CircuitBreaker:
         if self.is_locked():
             return None
 
-        peak = self._get_7day_equity_peak()
+        peak = self._get_7day_equity_peak(current_equity)
         if peak <= 0:
             return None
 
@@ -435,16 +435,83 @@ class CircuitBreaker:
             logger.warning("_get_daily_loss_pct error: %s", exc)
             return 0.0
 
-    def _get_7day_equity_peak(self) -> float:
-        """Get the highest equity value in the last 7 days from trade journal."""
+    def _get_7day_equity_peak(self, current_equity: float) -> float:
+        """
+        Compute the maximum equity value over the last 7 days.
+
+        Reconstructs the equity timeline from trade_journal net_pnl history,
+        working backwards from current_equity using suffix sums:
+            equity_before_trade_i = current_equity - sum(net_pnl from trade_i to now)
+
+        Result is cached in Redis with 1-hour TTL to avoid repeated DB scans.
+
+        Args:
+            current_equity: Current account equity (the reference end-point)
+
+        Returns:
+            Peak equity value, or 0.0 on error.
+        """
+        _CACHE_KEY = "circuit_breaker:7day_peak"
+        _CACHE_TTL = 3600  # 1 hour
+
+        # Fast path: Redis cache
         try:
             r = self._get_redis()
-            cached = r.get("circuit_breaker:7day_peak")
-            if cached:
+            cached = r.get(_CACHE_KEY)
+            if cached is not None:
                 return float(cached)
-            # Fallback: compute from DB (simplified — use cumulative PnL)
-            return 0.0
         except Exception:
+            pass
+
+        # Compute from DB
+        try:
+            db = self._get_db()
+            try:
+                from sqlalchemy import text
+                cutoff = datetime.now(timezone.utc) - timedelta(days=DRAWDOWN_PEAK_WINDOW_DAYS)
+                rows = db.execute(text(
+                    "SELECT net_pnl FROM trade_journal "
+                    "WHERE exit_timestamp >= :cutoff "
+                    "  AND exit_timestamp IS NOT NULL "
+                    "  AND net_pnl IS NOT NULL "
+                    "ORDER BY exit_timestamp ASC"
+                ), {"cutoff": cutoff}).fetchall()
+            finally:
+                db.close()
+
+            if not rows:
+                # No closed trades in window — current equity is the only data point
+                peak = current_equity
+            else:
+                net_pnls = [float(row.net_pnl) for row in rows]
+                n = len(net_pnls)
+
+                # suffix_sums[i] = sum(net_pnl[i..n-1])
+                # equity before trade[i] = current_equity - suffix_sums[i]
+                suffix_sums = [0.0] * n
+                suffix_sums[n - 1] = net_pnls[n - 1]
+                for i in range(n - 2, -1, -1):
+                    suffix_sums[i] = suffix_sums[i + 1] + net_pnls[i]
+
+                equities = [current_equity - s for s in suffix_sums]
+                equities.append(current_equity)  # equity after last trade
+                peak = max(equities)
+
+            # Cache result
+            try:
+                r = self._get_redis()
+                r.set(_CACHE_KEY, str(peak), ex=_CACHE_TTL)
+            except Exception:
+                pass
+
+            logger.debug(
+                "7-day equity peak computed: $%.2f (current: $%.2f, trades: %d)",
+                peak, current_equity, len(rows),
+            )
+            return peak
+
+        except Exception as exc:
+            logger.warning("_get_7day_equity_peak error: %s", exc)
             return 0.0
 
     def _get_current_regime(self) -> Optional[str]:

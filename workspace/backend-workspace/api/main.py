@@ -36,6 +36,7 @@ from api.schemas import (
     SignalCardResponse, SkipRequest, TradeJournalEntry,
     AnalyticsResponse, PortfolioResponse, BacktestRunRequest,
 )
+from api.auth import require_api_key
 from api.routes.config_routes import router as config_router
 from trading_core.cache import get_async_redis, RedisKeys
 
@@ -73,7 +74,56 @@ app.include_router(config_router)
 
 # In-memory signal store (populated by Redis pub/sub listener)
 _active_signals: dict = {}
-_open_positions: dict = {}
+
+
+async def _get_open_positions() -> dict:
+    """
+    Read open positions from Redis hash `portfolio:open_positions`.
+    Returns {asset: risk_pct}. Restart-safe: returns {} on Redis error.
+    """
+    try:
+        r = await get_async_redis()
+        data = await r.hgetall(RedisKeys.open_positions())
+        return {k: float(v) for k, v in data.items()}
+    except Exception:
+        return {}
+
+
+def _load_account_settings() -> tuple:
+    """
+    Load account equity, fee rate, and sizing parameters from DB ExchangeSettings.
+    Returns (account_equity, fee_rate, sizing_mode, fixed_usd, risk_pct, leverage, market_type).
+    Falls back to config.yaml defaults on DB error.
+    """
+    try:
+        from db.connection import get_session_factory
+        from config.config_service import get_active_exchange_settings, get_active_trading_params
+        db = get_session_factory()()
+        try:
+            ex = get_active_exchange_settings(db)
+        finally:
+            db.close()
+        return (
+            float(ex.get("account_balance_usd", 10000.0)),
+            float(ex.get("fee_rate", 0.001)),
+            ex.get("sizing_mode", "risk_pct"),
+            float(ex.get("fixed_usd_per_trade", 100.0)),
+            float(ex.get("risk_pct_per_trade", 0.02)),
+            int(ex.get("default_leverage", 5)),
+            ex.get("market_type", "futures"),
+        )
+    except Exception:
+        from config.config_system import ConfigSystem
+        cfg = ConfigSystem(os.environ.get("CONFIG_PATH", "config.yaml")).get()
+        return (
+            cfg.account.balance,
+            cfg.exchange.fee_rate,
+            cfg.position.mode,
+            cfg.position.fixed_usd,
+            cfg.position.risk_pct,
+            cfg.position.leverage,
+            cfg.exchange.market_type,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +149,7 @@ async def get_signals():
 
 
 @app.post("/api/signals/{signal_id}/confirm")
-async def confirm_signal(signal_id: str):
+async def confirm_signal(signal_id: str, _: None = Depends(require_api_key)):
     """
     Confirm a signal → send to Trade Executor.
     Satisfies: Requirements 18.2, 18.3, 19.1
@@ -130,20 +180,97 @@ async def confirm_signal(signal_id: str):
     if not signal:
         raise HTTPException(status_code=404, detail=f"Signal {signal_id} not found")
 
-    # Mark as submitted immediately (optimistic UI)
+    # --- Compute position size via RiskManager ---
+    try:
+        account_equity, fee_rate, sizing_mode, fixed_usd, risk_pct, leverage, market_type = (
+            _load_account_settings()
+        )
+    except Exception as exc:
+        logger.error("Failed to load account settings: %s", exc)
+        raise HTTPException(status_code=503, detail=f"Account settings unavailable: {exc}")
+
+    from risk.manager import RiskManager
+    rm = RiskManager(
+        mode=sizing_mode,
+        fixed_usd=fixed_usd,
+        risk_pct=risk_pct,
+        max_risk_pct=risk_pct,
+        leverage=leverage,
+        market_type=market_type,
+    )
+    entry_price = float(signal.get("entry_price", 0))
+    stop_loss = float(signal.get("stop_loss", 0))
+    # atr_value = SL distance — non-zero guard only; actual sizing uses sl_distance
+    atr_value = abs(entry_price - stop_loss)
+
+    size_result = rm.compute_position_size(
+        asset=signal.get("asset", ""),
+        entry_price=entry_price,
+        stop_loss=stop_loss,
+        account_equity=account_equity,
+        atr_value=atr_value,
+        open_positions=await _get_open_positions(),
+        fee_rate=fee_rate,
+    )
+
+    if not size_result.allowed:
+        logger.warning("Signal %s rejected by RiskManager: %s", signal_id, size_result.rejection_reason)
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "RISK_REJECTED", "reason": size_result.rejection_reason},
+        )
+
+    position_size_usd = size_result.position_size_usd
+
+    # Mark as executing immediately (optimistic UI)
     signal["user_action"] = "CONFIRM"
-    signal["status"] = "Submitted"
+    signal["status"] = "Executing"
+    signal["position_size_usd"] = position_size_usd
 
-    # Wire to Trade Executor (testnet enforced inside executor)
-    # In production: dispatch to Celery task for async execution
-    logger.info("Signal confirmed: %s %s score=%d",
-                signal_id, signal.get("asset"), signal.get("final_score"))
+    # --- Dispatch async execution via Celery (testnet enforced inside executor) ---
+    try:
+        from trade.tasks import execute_trade
+        execute_trade.delay(signal, position_size_usd)
+        logger.info(
+            "Trade dispatched: %s %s score=%d size=%.2f USD",
+            signal_id, signal.get("asset"), signal.get("final_score", 0), position_size_usd,
+        )
+    except Exception as exc:
+        # Celery unavailable — mark as failed, don't block user
+        signal["status"] = "Failed"
+        logger.error("Failed to dispatch execute_trade task for %s: %s", signal_id, exc)
+        raise HTTPException(status_code=503, detail=f"Trade dispatch failed: {exc}")
 
-    return {"status": "submitted", "signal_id": signal_id}
+    return {
+        "status": "executing",
+        "signal_id": signal_id,
+        "position_size_usd": position_size_usd,
+        "asset": signal.get("asset"),
+        "direction": signal.get("direction"),
+    }
+
+
+@app.get("/api/signals/{signal_id}/execution")
+async def get_execution_status(signal_id: str):
+    """
+    Poll the execution status of a confirmed signal.
+    Status progresses: Executing → Filled | Failed.
+    Satisfies: Requirement 18.3
+    """
+    from trading_core.cache import get_async_redis
+    r = await get_async_redis()
+    raw = await r.get(f"trade:status:{signal_id}")
+    if raw is None:
+        # Check in-memory signal for "Executing" / "Submitted" status
+        signal = _active_signals.get(signal_id)
+        if signal:
+            return {"signal_id": signal_id, "status": signal.get("status", "Unknown")}
+        raise HTTPException(status_code=404, detail=f"No execution record for signal {signal_id}")
+    return json.loads(raw)
 
 
 @app.post("/api/signals/{signal_id}/skip")
-async def skip_signal(signal_id: str, body: SkipRequest):
+async def skip_signal(signal_id: str, body: SkipRequest, _: None = Depends(require_api_key)):
     """
     Skip a signal with optional reason.
     Satisfies: Requirements 18.2, 18.4, 17.3
@@ -161,7 +288,7 @@ async def skip_signal(signal_id: str, body: SkipRequest):
 
 
 @app.patch("/api/signals/{signal_id}/expire")
-async def expire_signal(signal_id: str):
+async def expire_signal(signal_id: str, _: None = Depends(require_api_key)):
     """Mark a signal as expired (called by frontend countdown timer)."""
     signal = _active_signals.pop(signal_id, None)
     if signal:
@@ -281,9 +408,10 @@ async def get_portfolio():
     Return Portfolio_Heat and per-asset correlated group risk.
     Satisfies: Requirements 14.8, 18.9
     """
+    positions = await _get_open_positions()
     return {
-        "portfolio_heat": sum(_open_positions.values()) * 100.0,
-        "open_positions": _open_positions,
+        "portfolio_heat": sum(positions.values()) * 100.0,
+        "open_positions": positions,
     }
 
 
@@ -326,7 +454,7 @@ async def get_config():
 
 
 @app.post("/api/config/reload")
-async def reload_config():
+async def reload_config(_: None = Depends(require_api_key)):
     """
     Hot-reload config.yaml.
     Satisfies: Requirement 15.11
@@ -366,7 +494,7 @@ async def get_circuit_breaker_status():
 
 
 @app.post("/api/circuit-breaker/unlock")
-async def manual_unlock_circuit_breaker(body: dict):
+async def manual_unlock_circuit_breaker(body: dict, _: None = Depends(require_api_key)):
     """
     Manually unlock circuit breaker with review note.
     Required for Trigger 4 (drawdown from peak).
@@ -471,9 +599,10 @@ async def portfolio_stream(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
+            positions = await _get_open_positions()
             payload = json.dumps({
-                "portfolio_heat": sum(_open_positions.values()) * 100.0,
-                "open_positions": _open_positions,
+                "portfolio_heat": sum(positions.values()) * 100.0,
+                "open_positions": positions,
             })
             await websocket.send_text(payload)
             await asyncio.sleep(1.0)

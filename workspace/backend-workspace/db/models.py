@@ -247,9 +247,11 @@ class TradingParams(Base):
     correlation_threshold: Mapped[float] = mapped_column(Float, nullable=False, default=0.8)
     max_correlated_risk_pct: Mapped[float] = mapped_column(Float, nullable=False, default=3.0)
     portfolio_heat_limit_pct: Mapped[float] = mapped_column(Float, nullable=False, default=6.0)
+    # SL/TP parameters (user-configurable via FE → DB → ScoringService)
     atr_sl_multiplier: Mapped[float] = mapped_column(Float, nullable=False, default=1.5)
-    tp1_rr_ratio: Mapped[float] = mapped_column(Float, nullable=False, default=1.5)
-    tp2_rr_ratio: Mapped[float] = mapped_column(Float, nullable=False, default=2.5)
+    tp1_rr_ratio: Mapped[float] = mapped_column(Float, nullable=False, default=2.0)
+    tp2_rr_ratio: Mapped[float] = mapped_column(Float, nullable=False, default=3.0)
+    min_net_rr: Mapped[float] = mapped_column(Float, nullable=False, default=1.5)
     max_concurrent_positions: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
     max_daily_loss_pct: Mapped[float] = mapped_column(Float, nullable=False, default=5.0)
 

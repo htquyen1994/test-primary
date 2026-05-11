@@ -106,8 +106,13 @@ def detect_4h_bias(ohlcv_4h: pd.DataFrame) -> str:
     recent_lows = lows.iloc[-lookback:].values
     recent_highs = highs.iloc[-lookback:].values
 
-    higher_lows = all(recent_lows[i] >= recent_lows[i - 1] for i in range(1, len(recent_lows)))
-    lower_highs = all(recent_highs[i] <= recent_highs[i - 1] for i in range(1, len(recent_highs)))
+    _n_pairs = len(recent_lows) - 1
+    higher_lows = _n_pairs > 0 and sum(
+        recent_lows[i] >= recent_lows[i - 1] for i in range(1, len(recent_lows))
+    ) >= 0.7 * _n_pairs
+    lower_highs = _n_pairs > 0 and sum(
+        recent_highs[i] <= recent_highs[i - 1] for i in range(1, len(recent_highs))
+    ) >= 0.7 * _n_pairs
 
     # Bullish: above EMA + higher lows + trending
     if current_close > ema_val and higher_lows and adx_val > ADX_TRENDING_THRESHOLD:

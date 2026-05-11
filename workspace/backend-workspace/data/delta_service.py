@@ -33,6 +33,9 @@ DELTA_HISTORY_SIZE = 96   # 24h of 15m candles (24 × 4 = 96)
 DELTA_HISTORY_TTL = 25 * 3600  # 25 hours
 
 
+_LAST_TS_KEY_PREFIX = "delta_last_ts:"  # Redis key: delta_last_ts:{symbol}
+
+
 class DeltaService:
     """
     Polls trade tape and accumulates cumulative delta in Redis.
@@ -43,6 +46,7 @@ class DeltaService:
     def __init__(self, exchange_id: str, symbols: List[str]) -> None:
         self.exchange_id = exchange_id
         self.symbols = symbols
+        # _last_trade_id is kept as in-memory cache; authoritative value is in Redis
         self._last_trade_id: dict = {}
 
     def _get_exchange(self):
@@ -58,11 +62,21 @@ class DeltaService:
 
     async def _poll(self, symbol: str) -> None:
         """Poll trades and accumulate delta in Redis."""
+        # Load last-seen timestamp from Redis on first poll (restart safety)
+        r_init = self._get_redis()
+        _ts_key = f"{_LAST_TS_KEY_PREFIX}{symbol}"
+        try:
+            _stored = r_init.get(_ts_key)
+            if _stored and symbol not in self._last_trade_id:
+                self._last_trade_id[symbol] = int(_stored)
+        except Exception:
+            pass
+
         while True:
             try:
                 exchange = self._get_exchange()
                 r = self._get_redis()
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
 
                 trades = await loop.run_in_executor(
                     None,
@@ -73,21 +87,22 @@ class DeltaService:
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
 
-                # Only count new trades since last poll
-                # Use timestamp comparison as fallback for exchanges with string IDs
-                last_id = self._last_trade_id.get(symbol)
-                if last_id is None:
+                # Use timestamp-based deduplication — avoids lexicographic ID comparison bugs
+                # where "9" > "10" evaluates True (string comparison).
+                last_ts = self._last_trade_id.get(symbol)
+                if last_ts is None:
                     new_trades = trades
                 else:
-                    try:
-                        # Try numeric comparison first (most exchanges)
-                        new_trades = [t for t in trades if str(t["id"]) > str(last_id)]
-                    except (TypeError, ValueError):
-                        # Fallback: use timestamp
-                        new_trades = [t for t in trades if t.get("timestamp", 0) > last_id]
+                    new_trades = [t for t in trades if t.get("timestamp", 0) > last_ts]
 
                 if new_trades:
-                    self._last_trade_id[symbol] = str(new_trades[-1]["id"])
+                    latest_ts = max(t.get("timestamp", 0) for t in new_trades)
+                    self._last_trade_id[symbol] = latest_ts
+                    # Persist to Redis so restarts don't replay old trades
+                    try:
+                        r.set(_ts_key, str(latest_ts), ex=DELTA_TTL * 10)
+                    except Exception:
+                        pass
                     delta_increment = sum(
                         t["amount"] if t["side"] == "buy" else -t["amount"]
                         for t in new_trades

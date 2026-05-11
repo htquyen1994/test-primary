@@ -9,6 +9,7 @@ import { useState } from 'react'
 import { useAlertsStore } from '../store/alertsStore'
 import { CountdownTimer } from './CountdownTimer'
 import { ScoreBreakdown } from './ScoreBreakdown'
+import { apiFetch } from '../lib/api'
 import type { SignalCard as SignalCardType } from '../types'
 
 interface Props {
@@ -35,7 +36,7 @@ export function SignalCard({ signal, currentCandle = 0 }: Props) {
 
   async function handleConfirm() {
     try {
-      const res = await fetch(`/api/signals/${signal.signal_id}/confirm`, { method: 'POST' })
+      const res = await apiFetch(`/api/signals/${signal.signal_id}/confirm`, { method: 'POST' })
       if (res.ok) {
         setStatus('submitted')
         updateSignal(signal.signal_id, { status: 'Submitted', user_action: 'CONFIRM' })
@@ -48,7 +49,7 @@ export function SignalCard({ signal, currentCandle = 0 }: Props) {
 
   async function handleSkip() {
     try {
-      const res = await fetch(`/api/signals/${signal.signal_id}/skip`, {
+      const res = await apiFetch(`/api/signals/${signal.signal_id}/skip`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: skipReason || null }),
@@ -65,7 +66,7 @@ export function SignalCard({ signal, currentCandle = 0 }: Props) {
 
   async function handleExpire() {
     setStatus('expired')
-    await fetch(`/api/signals/${signal.signal_id}/expire`, { method: 'PATCH' })
+    await apiFetch(`/api/signals/${signal.signal_id}/expire`, { method: 'PATCH' })
     setTimeout(() => removeSignal(signal.signal_id), 1500)
   }
 

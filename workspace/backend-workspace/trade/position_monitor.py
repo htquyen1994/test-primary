@@ -17,31 +17,100 @@ from typing import Dict, Optional
 logger = logging.getLogger(__name__)
 
 # In-memory store of open positions: {trade_id: {asset, direction, entry_price, ...}}
+# Populated on startup from Redis; kept in sync on every change.
 _open_positions: Dict[str, dict] = {}
 
 
+# ---------------------------------------------------------------------------
+# Redis persistence helpers
+# ---------------------------------------------------------------------------
+
+def _get_redis():
+    from trading_core.cache import get_redis
+    return get_redis()
+
+
+def _redis_key():
+    from trading_core.cache import RedisKeys
+    return RedisKeys.open_positions()
+
+
+def _persist_to_redis(asset: str, risk_pct: float) -> None:
+    """Write (or update) one position in the Redis hash."""
+    try:
+        _get_redis().hset(_redis_key(), asset, str(risk_pct))
+    except Exception as exc:
+        logger.warning("Failed to persist open position to Redis: %s", exc)
+
+
+def _remove_from_redis(asset: str) -> None:
+    """Remove one position from the Redis hash."""
+    try:
+        _get_redis().hdel(_redis_key(), asset)
+    except Exception as exc:
+        logger.warning("Failed to remove open position from Redis: %s", exc)
+
+
+def load_positions_from_redis() -> None:
+    """
+    Restore _open_positions from Redis after a restart.
+    Call this once at application startup.
+    """
+    try:
+        data = _get_redis().hgetall(_redis_key())
+        for asset, risk_pct_str in data.items():
+            _open_positions[f"redis:{asset}"] = {
+                "asset": asset,
+                "risk_pct": float(risk_pct_str),
+            }
+        if data:
+            logger.info("Loaded %d open position(s) from Redis", len(data))
+    except Exception as exc:
+        logger.warning("Could not load open positions from Redis: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 def register_open_position(trade_id: str, position_info: dict) -> None:
-    """Register a newly opened position for monitoring."""
+    """
+    Register a newly opened position for monitoring.
+    Persists risk_pct to Redis hash so portfolio heat survives restarts.
+    """
     _open_positions[trade_id] = position_info
-    logger.debug("Position registered: %s %s", trade_id[:8], position_info.get("asset"))
+    asset = position_info.get("asset", "")
+    risk_pct = position_info.get("risk_pct", 0.0)
+    if asset:
+        _persist_to_redis(asset, risk_pct)
+    logger.debug("Position registered: %s %s", trade_id[:8], asset)
 
 
 def unregister_position(trade_id: str) -> None:
-    """Remove a closed position from monitoring."""
-    _open_positions.pop(trade_id, None)
+    """Remove a closed position from monitoring and from Redis."""
+    info = _open_positions.pop(trade_id, None)
+    if info:
+        asset = info.get("asset", "")
+        if asset:
+            _remove_from_redis(asset)
 
 
 def get_open_positions_risk() -> Dict[str, float]:
     """
     Return {asset: risk_pct} for all open positions.
-    Used by CorrelationManager.get_portfolio_heat().
+    Reads from Redis (authoritative) with in-memory fallback.
 
     Satisfies: Requirement 14.6
     """
-    return {
-        info["asset"]: info.get("risk_pct", 0.0)
-        for info in _open_positions.values()
-    }
+    try:
+        data = _get_redis().hgetall(_redis_key())
+        return {asset: float(v) for asset, v in data.items()}
+    except Exception:
+        # Fall back to in-memory dict if Redis is unavailable
+        return {
+            info["asset"]: info.get("risk_pct", 0.0)
+            for info in _open_positions.values()
+        }
 
 
 async def check_position_closed(
@@ -94,7 +163,10 @@ async def check_position_closed(
     return False
 
 
-# Celery task (registered when celery_app is available)
+# ---------------------------------------------------------------------------
+# Celery task
+# ---------------------------------------------------------------------------
+
 try:
     from celery_app import app as celery_app
 
@@ -106,9 +178,6 @@ try:
 
         Satisfies: Requirements 19.10, 14.6
         """
-        import asyncio
-        from trading_core.exchange import get_exchange_client
-
         if not _open_positions:
             return {"checked": 0, "closed": 0}
 

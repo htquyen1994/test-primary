@@ -22,10 +22,42 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+import time as _time
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+class _TokenBucket:
+    """
+    Thread-safe token bucket for application-level API rate limiting.
+
+    Supplements ccxt's built-in rate limiter with a configurable burst limit.
+    Default: 10 req/s sustained, burst up to 20 requests.
+    """
+
+    def __init__(self, rate: float = 10.0, capacity: float = 20.0) -> None:
+        self._rate = rate          # tokens refilled per second
+        self._capacity = capacity  # max burst size
+        self._tokens = capacity
+        self._last = _time.monotonic()
+        self._lock = threading.Lock()
+
+    def consume(self) -> None:
+        """Block until a token is available, then consume one."""
+        while True:
+            with self._lock:
+                now = _time.monotonic()
+                elapsed = now - self._last
+                self._last = now
+                self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self._rate
+            _time.sleep(wait)
 
 
 class ExchangeClient:
@@ -52,6 +84,7 @@ class ExchangeClient:
 
         self._exchange = exchange_class(default_options)
         self._exchange_id = exchange_id
+        self._rate_limiter = _TokenBucket()
         logger.info("ExchangeClient created: %s", exchange_id)
 
     # ------------------------------------------------------------------
@@ -69,6 +102,7 @@ class ExchangeClient:
         Fetch OHLCV candles.
         Returns list of [timestamp, open, high, low, close, volume].
         """
+        self._rate_limiter.consume()
         return self._exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
 
     def fetch_order_book(self, symbol: str, limit: int = 20) -> dict:
@@ -76,6 +110,7 @@ class ExchangeClient:
         Fetch order book snapshot.
         Returns {"bids": [[price, amount], ...], "asks": [[price, amount], ...]}.
         """
+        self._rate_limiter.consume()
         return self._exchange.fetch_order_book(symbol, limit=limit)
 
     def fetch_trades(self, symbol: str, limit: int = 100) -> List[dict]:
@@ -83,12 +118,14 @@ class ExchangeClient:
         Fetch recent trades (trade tape).
         Returns list of {"id", "timestamp", "side", "price", "amount"}.
         """
+        self._rate_limiter.consume()
         return self._exchange.fetch_trades(symbol, limit=limit)
 
     def fetch_ticker(self, symbol: str) -> dict:
         """
         Fetch current ticker (last price, bid, ask, volume).
         """
+        self._rate_limiter.consume()
         return self._exchange.fetch_ticker(symbol)
 
     def fetch_funding_rate(self, symbol: str) -> dict:
@@ -96,6 +133,7 @@ class ExchangeClient:
         Fetch current funding rate for a perpetual futures symbol.
         Returns {} if not available (spot markets).
         """
+        self._rate_limiter.consume()
         try:
             return self._exchange.fetch_funding_rate(symbol)
         except Exception:
@@ -148,25 +186,25 @@ class ExchangeClient:
         self, symbol: str, timeframe: str, limit: int = 100
     ) -> List[list]:
         """Async wrapper — runs fetch_ohlcv in thread pool."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None, lambda: self.fetch_ohlcv(symbol, timeframe, limit)
         )
 
     async def async_fetch_order_book(self, symbol: str, limit: int = 20) -> dict:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None, lambda: self.fetch_order_book(symbol, limit)
         )
 
     async def async_fetch_trades(self, symbol: str, limit: int = 100) -> List[dict]:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None, lambda: self.fetch_trades(symbol, limit)
         )
 
     async def async_fetch_ticker(self, symbol: str) -> dict:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None, lambda: self.fetch_ticker(symbol)
         )

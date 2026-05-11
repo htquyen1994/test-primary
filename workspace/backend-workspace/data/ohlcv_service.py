@@ -111,7 +111,7 @@ class OHLCVService:
         try:
             exchange = self._get_exchange()
             r = self._get_redis()
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             candles = await loop.run_in_executor(
                 None,
@@ -158,7 +158,7 @@ class OHLCVService:
             try:
                 exchange = self._get_exchange()
                 r = self._get_redis()
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
 
                 candles = await loop.run_in_executor(
                     None,

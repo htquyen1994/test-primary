@@ -133,7 +133,13 @@ class CorrelationManager:
         if df.empty or len(df) < 2:
             return pd.DataFrame()
 
-        self._correlation_matrix = df.corr(method="pearson")
+        # Use log returns instead of raw prices to avoid spurious correlations
+        # from shared price levels (e.g. all assets rising together in a bull market)
+        log_returns = np.log(df / df.shift(1)).dropna()
+        if log_returns.empty or len(log_returns) < 2:
+            self._correlation_matrix = pd.DataFrame()
+            return self._correlation_matrix
+        self._correlation_matrix = log_returns.corr(method="pearson")
         return self._correlation_matrix
 
     def get_correlated_group(
