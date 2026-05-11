@@ -102,3 +102,21 @@ logging:
   log_dir: "logs/"
   signal_log_dir: "logs/signals/"
   backtest_log_dir: "logs/backtest/"
+
+# ---------------------------------------------------------------------------
+# MOCK EXCHANGE — Algorithm Validation Phase
+# Set mock_exchange.enabled = true to route all orders to mock-exchange-workspace
+# instead of a real exchange. Requires mock-exchange-workspace running on url below.
+# ---------------------------------------------------------------------------
+mock_exchange:
+  enabled: false
+  url: "http://localhost:8001"
+  timeout_seconds: 5
+
+# ---------------------------------------------------------------------------
+# AUDIT — Signal + Trade audit for algorithm validation
+# Set audit.enabled = true to emit scoring snapshots to mock-exchange-workspace.
+# Requires mock_exchange.enabled = true and Redis running.
+# ---------------------------------------------------------------------------
+audit:
+  enabled: false

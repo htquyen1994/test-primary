@@ -1,10 +1,11 @@
 """
 Trade Executor
 ===============
-Submits orders to the exchange via ccxt after user confirms a signal.
+Submits orders to the exchange via ExchangeInterface after user confirms a signal.
 Automatically places SL/TP orders after entry fill.
 
-SAFETY: Testnet mode is enforced at code level.
+SAFETY: Testnet mode is enforced at code level for live exchanges.
+        Mock exchanges (is_mock=True) bypass the testnet guard.
         exchange.testnet must be explicitly False for live trading.
 
 Satisfies: Requirements 19.1–19.9
@@ -14,20 +15,37 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Optional
+
+from trading_core.exchange.interface import (
+    ExchangeInterface,
+    Order,
+    OrderSide,
+    OrderType,
+)
 
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 1.0  # seconds
 
+_SIDE_MAP: dict[str, OrderSide] = {
+    "buy": OrderSide.BUY,
+    "sell": OrderSide.SELL,
+}
+
+_ORDER_TYPE_MAP: dict[str, OrderType] = {
+    "limit": OrderType.LIMIT,
+    "stop_loss": OrderType.STOP_LOSS,
+    "take_profit": OrderType.TAKE_PROFIT,
+    "market": OrderType.MARKET,
+}
+
 
 class LiveTradingNotAllowedError(RuntimeError):
     """
-    Raised when testnet is not explicitly False.
+    Raised when testnet is not explicitly False on a live exchange.
     Satisfies: Requirements 19.8, 19.9
     """
     pass
@@ -46,23 +64,26 @@ class ExecutionResult:
 
 class TradeExecutor:
     """
-    Submits orders to the exchange via ccxt.
-    Enforces testnet safety at the code level.
+    Submits orders to the exchange via ExchangeInterface.
+    Enforces testnet safety at the code level for live exchanges.
+    Mock exchanges (is_mock=True) bypass the testnet guard.
 
     Satisfies: Requirements 19.1–19.9
     """
 
-    def __init__(self, exchange, config) -> None:
+    def __init__(self, exchange: ExchangeInterface, config) -> None:
         self._exchange = exchange
         self._config = config
 
     def _assert_testnet_safe(self) -> None:
         """
         Guard: raises LiveTradingNotAllowedError if testnet is not explicitly False.
-        This MUST run before any ccxt call.
+        Bypassed automatically for mock exchanges (is_mock=True).
 
         Satisfies: Requirements 19.8, 19.9
         """
+        if getattr(self._exchange, "is_mock", False):
+            return
         testnet = getattr(self._config.exchange, "testnet", True)
         if testnet is not False:
             raise LiveTradingNotAllowedError(
@@ -80,7 +101,7 @@ class TradeExecutor:
         Execute a confirmed signal: submit entry order + SL + TP.
 
         Args:
-            signal_card:      Signal Card dict from alert builder
+            signal_card:       Signal Card dict from alert builder
             position_size_usd: Position size in USD from Risk Manager
 
         Returns:
@@ -141,12 +162,13 @@ class TradeExecutor:
             asset, direction, entry_price, actual_fill, actual_slippage,
         )
 
+        is_mock = getattr(self._exchange, "is_mock", False)
         return ExecutionResult(
             success=True,
             order_id=entry_result.order_id,
             actual_fill_price=actual_fill,
             actual_slippage=actual_slippage,
-            is_testnet=True,  # always True since _assert_testnet_safe passed
+            is_testnet=not is_mock,
         )
 
     async def _submit_with_retry(
@@ -158,39 +180,33 @@ class TradeExecutor:
         order_type: str = "limit",
     ) -> ExecutionResult:
         """
-        Submit an order with exponential backoff retry.
-        Retries up to MAX_RETRIES times on API error.
+        Submit an order via ExchangeInterface with exponential backoff retry.
+        Retries up to MAX_RETRIES times on exchange error.
 
         Satisfies: Requirement 19.7
         """
+        exchange_side = _SIDE_MAP[side]
+        exchange_order_type = _ORDER_TYPE_MAP.get(order_type, OrderType.LIMIT)
+        is_mock = getattr(self._exchange, "is_mock", False)
+
         last_error = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                # Route to testnet (already validated by _assert_testnet_safe)
-                if order_type == "limit":
-                    order = await self._exchange.create_limit_order(
-                        asset, side, amount, price
-                    )
-                elif order_type == "stop_loss":
-                    order = await self._exchange.create_order(
-                        asset, "stop_loss_limit", side, amount, price,
-                        {"stopPrice": price}
-                    )
-                elif order_type == "take_profit":
-                    order = await self._exchange.create_order(
-                        asset, "take_profit_limit", side, amount, price,
-                        {"stopPrice": price}
-                    )
-                else:
-                    order = await self._exchange.create_market_order(asset, side, amount)
+                order: Order = await self._exchange.create_order(
+                    symbol=asset,
+                    side=exchange_side,
+                    order_type=exchange_order_type,
+                    amount=amount,
+                    price=price,
+                )
 
-                fill_price = float(order.get("price", price) or price)
+                fill_price = order.fill_price if order.fill_price is not None else price
                 return ExecutionResult(
                     success=True,
-                    order_id=str(order.get("id", "")),
+                    order_id=order.order_id,
                     actual_fill_price=fill_price,
                     actual_slippage=fill_price - price,
-                    is_testnet=True,
+                    is_testnet=not is_mock,
                 )
 
             except Exception as exc:
@@ -211,5 +227,5 @@ class TradeExecutor:
         return ExecutionResult(
             success=False,
             error=str(last_error),
-            is_testnet=True,
+            is_testnet=not is_mock,
         )

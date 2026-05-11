@@ -85,12 +85,36 @@ async def main():
     from data.orderbook_service import OrderBookService
     from data.delta_service import DeltaService
     from engine.scoring_service import ScoringService
+    from trading_core.cache import get_redis
+
+    raw_cfg = cfg.get()
+
+    # --- Mock Exchange injection (Algorithm Validation Phase) ---
+    mock_cfg = getattr(raw_cfg, "mock_exchange", None)
+    mock_enabled = getattr(mock_cfg, "enabled", False) if mock_cfg else False
+    if mock_enabled:
+        from exchange.mock_http_client import MockExchangeHttpClient
+        mock_url = getattr(mock_cfg, "url", "http://localhost:8001")
+        mock_timeout = getattr(mock_cfg, "timeout_seconds", 5)
+        exchange = MockExchangeHttpClient(base_url=mock_url, timeout=float(mock_timeout))
+        logger.info("Mock exchange enabled — routing orders to %s", mock_url)
+    else:
+        exchange = None  # TradeExecutor not used without mock or live config
+
+    # --- Audit Client injection ---
+    audit_cfg = getattr(raw_cfg, "audit", None)
+    audit_enabled = getattr(audit_cfg, "enabled", False) if audit_cfg else False
+    audit_client = None
+    if audit_enabled:
+        from audit.client import AuditClient
+        audit_client = AuditClient(redis_client=get_redis(), enabled=True)
+        logger.info("Audit enabled — emitting snapshots to audit:pending_snapshots")
 
     # Instantiate services
     ohlcv_svc = OHLCVService(exchange_id, assets, timeframes)
     ob_svc = OrderBookService(exchange_id, assets)
     delta_svc = DeltaService(exchange_id, assets)
-    scoring_svc = ScoringService(config=cfg)
+    scoring_svc = ScoringService(config=cfg, audit_client=audit_client)
 
     logger.info("Starting all services...")
     await asyncio.gather(

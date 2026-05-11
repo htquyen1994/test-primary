@@ -33,9 +33,10 @@ class ScoringService:
     Runs in a background thread to avoid blocking the event loop.
     """
 
-    def __init__(self, config=None) -> None:
+    def __init__(self, config=None, audit_client=None) -> None:
         self._loop = None
         self._config = config  # ConfigSystem instance; None → use module-level defaults
+        self._audit_client = audit_client
         from engine.correlation_manager import CorrelationManager
         self._correlation_manager = CorrelationManager()
 
@@ -181,6 +182,32 @@ class ScoringService:
                 ohlcv_1h if not ohlcv_1h.empty else ohlcv, ohlcv
             )
 
+            _audit = {
+                "type": "signal_snapshot",
+                "symbol": symbol, "timeframe": timeframe,
+                "timestamp_candle_close": datetime.now(timezone.utc).isoformat(),
+                "signal_result": "NO_SIGNAL",
+                "final_score": 0,
+                "score_breakdown": None,
+                "regime": regime_state.regime,
+                "regime_multiplier": regime_state.score_multiplier,
+                "btc_guard_active": False,
+                "circuit_breaker_locked": False,
+                "blocking_reason": None,
+                "blocking_detail": None,
+                "entry_price_proposed": None,
+                "sl_proposed": None,
+                "tp1_proposed": None,
+                "tp2_proposed": None,
+                "atr_value": atr_val,
+                "adx_value": adx_val,
+                "delta_value": delta,
+                "delta_threshold": dynamic_threshold,
+                "funding_rate": funding_rate,
+                "ob_available": order_book_available,
+                "signal_id": None,
+            }
+
             # --- Module scores (needed for filter context) ---
             vp = compute_volume_profile(ohlcv.iloc[-96:])
 
@@ -277,6 +304,11 @@ class ScoringService:
                         extra={"filter_block": f.name, "block_reason": result.block_reason},
                     )
                     publish_log(r, log_entry)
+                    _audit["blocking_reason"] = self._map_filter_to_reason(f.name)
+                    _audit["blocking_detail"] = result.block_reason
+                    _audit["btc_guard_active"] = f.name == "btc_guard"
+                    _audit["circuit_breaker_locked"] = f.name == "circuit_breaker"
+                    self._emit_audit(_audit)
                     return
 
                 combined_size_mult *= result.size_multiplier
@@ -387,12 +419,26 @@ class ScoringService:
                 stop_loss = tp1 = tp2 = gross_rr = net_rr = 0.0
 
             # --- Persist to SQL Server ---
-            self._persist_signal(
+            signal_id = self._persist_signal(
                 symbol, timeframe, ohlcv, score, smc, vsa, of, ctx, bonus,
                 regime_state, funding_rate,
                 stop_loss=stop_loss, tp1=tp1, tp2=tp2,
                 signal_direction=signal_direction,
             )
+
+            # --- Emit audit snapshot ---
+            _audit["final_score"] = score.final_score
+            _audit["score_breakdown"] = {
+                "of": of.score, "smc": smc.score,
+                "vsa": vsa.score, "ctx": ctx.score, "bonus": bonus,
+            }
+            _audit["signal_result"] = "SIGNAL" if score.classification == "ALERT" else "NO_SIGNAL"
+            _audit["signal_id"] = signal_id
+            _audit["entry_price_proposed"] = close
+            _audit["sl_proposed"] = stop_loss
+            _audit["tp1_proposed"] = tp1
+            _audit["tp2_proposed"] = tp2
+            self._emit_audit(_audit)
 
             # --- Publish ALERT (only when ATR is valid and R:R meets minimum) ---
             if score.classification == "ALERT":
@@ -525,8 +571,8 @@ class ScoringService:
 
         return round(stop_loss, 8), round(tp1, 8), round(tp2, 8), gross_rr, net_rr
 
-    def _persist_signal(self, symbol, timeframe, ohlcv, score, smc, vsa, of, ctx, bonus, regime_state, funding_rate, stop_loss, tp1, tp2, signal_direction="long"):
-        """Persist signal to SQL Server signal_log table."""
+    def _persist_signal(self, symbol, timeframe, ohlcv, score, smc, vsa, of, ctx, bonus, regime_state, funding_rate, stop_loss, tp1, tp2, signal_direction="long") -> Optional[str]:
+        """Persist signal to SQL Server. Returns signal log_id (UUID str) or None on failure."""
         try:
             from db.connection import get_session_factory
             from api.signal_log_writer import write_signal_log
@@ -554,10 +600,12 @@ class ScoringService:
                 portfolio_heat=0.0, correlated_group_risk=0.0,
                 expires_at_candle=len(ohlcv) + 15,
             )
-            write_signal_log(signal_obj, db)
+            log_id = write_signal_log(signal_obj, db)
             db.close()
+            return log_id
         except Exception as exc:
             logger.warning("Failed to persist signal_log: %s", exc)
+            return None
 
     def _publish_alert(self, r, symbol, timeframe, ohlcv, score, smc, vsa, of, ctx, bonus, regime_state, order_book_available=True, combined_size_mult=1.0, daily_bias="NEUTRAL", filter_warnings=None, stop_loss=0.0, tp1=0.0, tp2=0.0, gross_rr=0.0, net_rr=0.0, signal_direction="long"):
         """Publish ALERT signal to Redis alerts:channel."""
@@ -602,3 +650,16 @@ class ScoringService:
             return filters_cfg.get("active", ["mtf_bias", "btc_guard", "circuit_breaker", "daily_bias"])
         except Exception:
             return ["mtf_bias", "btc_guard", "circuit_breaker", "daily_bias"]
+
+    def _emit_audit(self, audit_data: dict) -> None:
+        if self._audit_client is not None:
+            self._audit_client.emit("signal_snapshot", audit_data)
+
+    @staticmethod
+    def _map_filter_to_reason(filter_name: str) -> str:
+        return {
+            "mtf_bias": "MTF_BLOCK",
+            "btc_guard": "BTC_GUARD",
+            "circuit_breaker": "CB_LOCKED",
+            "daily_bias": "REGIME",
+        }.get(filter_name, "LOW_SCORE")
