@@ -1,0 +1,15 @@
+# requirements-docker.txt
+# Used by Dockerfile for Celery workers (Redis-based signal scoring).
+# Celery workers communicate with SQL Server via the FastAPI backend,
+# NOT directly — so pyodbc is NOT needed in Docker containers.
+# SQL Server connection is only needed by the FastAPI process (run locally).
+
+ccxt>=4.3,<5.0
+redis>=5.0,<6.0
+aioredis>=2.0,<3.0
+celery>=5.3,<6.0
+kombu>=5.3,<6.0
+PyYAML>=6.0
+pandas>=2.2,<3.0
+numpy>=1.26,<2.0
+python-dotenv>=1.0

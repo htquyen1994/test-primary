@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python -m pytest tests/unit/test_risk_manager.py -v)",
+      "Bash(.venv/Scripts/python -m pytest tests/properties/test_risk_properties.py -v)",
+      "Bash(.venv/Scripts/python -m pytest tests/unit/test_scorer.py tests/properties/test_scorer_properties.py tests/unit/test_signal_card_properties.py tests/properties/test_signal_card_properties.py -v)",
+      "Bash(.venv/Scripts/python -m pytest tests/unit/test_scorer.py tests/properties/test_scorer_properties.py tests/properties/test_signal_card_properties.py -v)",
+      "Bash(python -m pytest tests/unit/test_scoring_service.py -v)",
+      "Bash(python -m pytest tests/unit/test_scorer.py -v -p no:web3)",
+      "Bash(pip install:*)",
+      "Bash(python -c \"import sys; sys.path.insert\\(0, ''''.''''\\); from trading_core.cache import get_redis\")",
+      "Bash(PYTHONPATH=\"D:/workspace/trade-workspace/workspace/trading-core\" python -c \"from trading_core.cache import get_redis, RedisKeys; print\\(''OK''\\)\")",
+      "Bash(PYTHONPATH=\"D:/workspace/trade-workspace/workspace/trading-core\" python -c \":*)",
+      "Bash(PYTHONPATH=\"D:/workspace/trade-workspace/workspace/trading-core\" python -m pytest tests/unit/test_scorer.py -v --no-header)",
+      "Bash(python:*)",
+      "Bash(PYTHONPATH=\"D:/workspace/trade-workspace/workspace/trading-core\" python -m pytest tests/unit/test_scorer.py --no-header)",
+      "Bash(PYTHONPATH=\"D:/workspace/trade-workspace/workspace/trading-core\" python -m pytest tests/unit/test_scoring_service.py --no-header)",
+      "Bash(PYTHONPATH=\"D:/workspace/trade-workspace/workspace/trading-core\" python -m pytest tests/unit/test_scorer.py tests/unit/test_risk_manager.py tests/unit/test_scoring_service.py --no-header)",
+      "Bash(PYTHONPATH=\"D:/workspace/trade-workspace/workspace/trading-core\" python -m pytest tests/unit/test_scoring_service.py tests/unit/test_scorer.py tests/unit/test_risk_manager.py --no-header)",
+      "Bash(PYTHONPATH=\"D:/workspace/trade-workspace/workspace/trading-core\" python -m pytest tests/unit/test_scoring_service.py tests/unit/test_scorer.py tests/unit/test_risk_manager.py --no-header -q)",
+      "Bash(PYTHONPATH=\"D:/workspace/trade-workspace/workspace/trading-core\" python -m pytest tests/unit/test_circuit_breaker.py -v --no-header)",
+      "Bash(PYTHONPATH=\"D:/workspace/trade-workspace/workspace/trading-core\" python -m pytest tests/unit/test_trade_executor.py -v --no-header -q)",
+      "Bash(PYTHONPATH=\"D:/workspace/trade-workspace/workspace/trading-core\" python -m pytest tests/unit/test_trade_executor.py tests/unit/test_circuit_breaker.py tests/unit/test_risk_manager.py tests/unit/test_scorer.py tests/unit/test_scoring_service.py -q --no-header)",
+      "Bash(ls D:/workspace/trade-workspace/workspace/frontend-workspace/*.env*)",
+      "Bash(ls D:/workspace/trade-workspace/workspace/frontend-workspace/.env*)",
+      "Bash(ls D:/workspace/trade-workspace/workspace/backend-workspace/.env*)",
+      "Bash(PYTHONPATH=\"D:/workspace/trade-workspace/workspace/trading-core\" python -m pytest tests/unit/test_signal_direction.py -v)",
+      "Bash(PYTHONPATH=\"D:/workspace/trade-workspace/workspace/trading-core\" python -m pytest tests/unit/test_ob_direction_filter.py -v)",
+      "Bash(PYTHONPATH=\"D:/workspace/trade-workspace/workspace/trading-core\" python -m pytest tests/unit/test_signal_direction.py tests/unit/test_ob_direction_filter.py -v)",
+      "Bash(find /d/workspace/trade-workspace/workspace/backend-workspace/trading_core -name *.py)",
+      "Bash(find /d/workspace/trade-workspace/workspace/backend-workspace -name client.py -not -path */.venv/* 2)",
+      "Bash(/dev/null find:*)",
+      "Bash(head -5 find /d/workspace/trade-workspace/workspace/backend-workspace -path */exchange/* -name *.py -not -path */.venv/*)",
+      "Bash(find /d/workspace/trade-workspace/workspace/backend-workspace/backtest -name *.py)",
+      "Bash(find /d/workspace/trade-workspace/workspace/backend-workspace -name docker-compose*.yml -o -name redis.conf)",
+      "Bash(find /d/workspace/trade-workspace -name client.py -not -path */.venv/* 2)",
+      "Bash(/dev/null cat:*)"
+    ]
+  }
+}

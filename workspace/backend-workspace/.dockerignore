@@ -1,0 +1,13 @@
+# Exclude from Docker build context
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.hypothesis/
+*.db
+trading.db
+logs/
+.env
+.git/
+node_modules/
