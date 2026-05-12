@@ -46,6 +46,7 @@ export function PortfolioHeader() {
 
         <nav className="flex gap-4 text-sm">
           <a href="/" className="text-gray-300 hover:text-white transition-colors">Signals</a>
+          <a href="/monitor" className="text-gray-300 hover:text-white transition-colors">Monitor</a>
           <a href="/journal" className="text-gray-300 hover:text-white transition-colors">Journal</a>
           <a href="/analytics" className="text-gray-300 hover:text-white transition-colors">Analytics</a>
           <a href="/logs" className="text-gray-300 hover:text-white transition-colors">Logs</a>

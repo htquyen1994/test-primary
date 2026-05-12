@@ -38,6 +38,7 @@ from api.schemas import (
 )
 from api.auth import require_api_key
 from api.routes.config_routes import router as config_router
+from api.routes.monitor_routes import router as monitor_router
 from trading_core.cache import get_async_redis, RedisKeys
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,9 @@ app.add_middleware(
 
 # Register config management routes
 app.include_router(config_router)
+
+# Register monitor routes (exchange/audit proxy + pending orders)
+app.include_router(monitor_router)
 
 # In-memory signal store (populated by Redis pub/sub listener)
 _active_signals: dict = {}
