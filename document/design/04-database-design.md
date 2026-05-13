@@ -109,8 +109,60 @@ erDiagram
         DATETIME2 created_at
     }
 
+    trading_params {
+        NVARCHAR id PK
+        NVARCHAR version_tag
+        NVARCHAR version_note
+        BIT is_active
+        DATETIME2 created_at
+        DATETIME2 activated_at
+        INT score_alert_threshold
+        INT score_watch_threshold
+        FLOAT adx_trending_threshold
+        FLOAT atr_parabolic_multiplier
+        FLOAT atr_sl_multiplier
+        FLOAT tp1_rr_ratio
+        FLOAT tp2_rr_ratio
+        FLOAT min_net_rr
+        INT max_concurrent_positions
+        FLOAT max_daily_loss_pct
+    }
+
+    exchange_settings {
+        NVARCHAR id PK
+        NVARCHAR profile_name
+        BIT is_active
+        NVARCHAR exchange_id
+        NVARCHAR market_type
+        BIT testnet
+        NVARCHAR api_key_encrypted
+        NVARCHAR api_secret_encrypted
+        FLOAT account_balance_usd
+        NVARCHAR sizing_mode
+        FLOAT risk_pct_per_trade
+        INT default_leverage
+        FLOAT fee_rate
+        FLOAT slippage_pct
+    }
+
+    exchange_assets {
+        NVARCHAR id PK
+        NVARCHAR exchange_settings_id FK
+        NVARCHAR symbol
+        BIT enabled
+        INT leverage_override
+        DATETIME2 created_at
+    }
+
     signal_log ||--o{ trade_journal : "confirmed as trade"
+    exchange_settings ||--o{ exchange_assets : "has assets"
 ```
+
+> **Ghi chú type mapping (SQL Server):**
+> - `UUID` → `NVARCHAR(36)` với `DEFAULT NEWID()`
+> - `TIMESTAMPTZ` → `DATETIME2` (UTC enforced via application)
+> - `NUMERIC/JSONB` → `FLOAT` / `NVARCHAR(MAX)`
+> - `BOOLEAN` → `BIT`
 
 ---
 
@@ -414,6 +466,69 @@ FROM circuit_breaker_state
 WHERE triggered_at >= DATEADD(DAY, -30, GETUTCDATE())
 GROUP BY trigger_type;
 ```
+
+---
+
+### Table: trading_params
+
+> **Migration:** `002_config_tables.sql` + `004_trading_params_patch.sql`  
+> **Mục đích:** Versioned trading parameters — mỗi lần thay đổi tạo row mới, giữ lịch sử. ScoringService đọc active row ưu tiên hơn config.yaml. Quản lý qua FE `/config/trading`.
+
+**Key columns (trích):**
+
+| Column | Type | Default | Description |
+|--------|------|---------|-------------|
+| `id` | NVARCHAR(36) PK | NEWID() | UUID |
+| `version_tag` | NVARCHAR(50) | required | e.g. `"v1.0"` |
+| `is_active` | BIT | 0 | Chỉ 1 row active tại một thời điểm |
+| `score_alert_threshold` | INT | 75 | Min score → ALERT |
+| `score_watch_threshold` | INT | 55 | Min score → WATCH |
+| `atr_sl_multiplier` | FLOAT | 1.5 | SL = entry ± ATR × N |
+| `tp1_rr_ratio` | FLOAT | **2.0** | TP1 = entry ± SL_dist × N |
+| `tp2_rr_ratio` | FLOAT | **3.0** | TP2 R:R ratio |
+| `min_net_rr` | FLOAT | 1.5 | ALERT suppressed nếu net R:R < N |
+| `max_daily_loss_pct` | FLOAT | 5.0 | CB Trigger 3 threshold |
+
+> ⚠️ **Known gap (đã fix migration 004):** `migration 002` có default sai cho `tp1_rr_ratio=1.5` và `tp2_rr_ratio=2.5`. Đúng phải là 2.0/3.0. Column `min_net_rr` cũng bị thiếu trong 002. **Migration 004 đã sửa** cả hai.
+
+---
+
+### Table: exchange_settings
+
+> **Migration:** `002_config_tables.sql`  
+> **Mục đích:** Exchange credentials và account config. API keys lưu **AES-256 encrypted** qua `CONFIG_ENCRYPTION_KEY`. Quản lý qua FE `/config/exchange`.
+
+**Key columns:**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | NVARCHAR(36) PK | UUID |
+| `profile_name` | NVARCHAR(100) | e.g. `"default"` |
+| `is_active` | BIT | Active profile |
+| `exchange_id` | NVARCHAR(50) | ccxt ID: `"binance"`, `"bybit"` |
+| `testnet` | BIT | **DEFAULT 1 — phải đặt 0 cho live** |
+| `api_key_encrypted` | NVARCHAR(MAX) | AES-256 via `config_service.encrypt_value()` |
+| `api_secret_encrypted` | NVARCHAR(MAX) | Encrypted |
+| `account_balance_usd` | FLOAT | Account equity |
+| `sizing_mode` | NVARCHAR(20) | `fixed_usd` / `risk_pct` / `kelly` |
+| `risk_pct_per_trade` | FLOAT | DEFAULT 0.02 (2%) |
+| `default_leverage` | INT | DEFAULT 5 |
+| `fee_rate` | FLOAT | DEFAULT 0.001 (0.1%) |
+
+---
+
+### Table: exchange_assets
+
+> **Migration:** `002_config_tables.sql`  
+> **Mục đích:** Per-symbol config liên kết với một `exchange_settings` profile.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | NVARCHAR(36) PK | UUID |
+| `exchange_settings_id` | NVARCHAR(36) | FK → exchange_settings.id *(soft, không có constraint)* |
+| `symbol` | NVARCHAR(30) | e.g. `"BTC/USDT"` |
+| `enabled` | BIT | DEFAULT 1 |
+| `leverage_override` | INT | NULL = dùng default_leverage từ exchange_settings |
 
 ---
 
