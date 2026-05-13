@@ -93,9 +93,9 @@ python main.py
 cd workspace\backend-workspace
 .\.venv\Scripts\activate
 $env:PYTHONPATH = "$PWD\..\trading-core"
-celery -A celery_app worker --loglevel=info -Q scoring,default --concurrency=2
 
-# Nếu lỗi trên Windows, thêm --pool=solo
+# Windows: bắt buộc dùng --pool=solo
+# (prefork/billiard bị lỗi PermissionError WinError 5 trên Windows)
 celery -A celery_app worker --loglevel=info --pool=solo -Q scoring,default
 ```
 
