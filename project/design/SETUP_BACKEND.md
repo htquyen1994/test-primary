@@ -3,7 +3,8 @@
 > **OS:** Windows  
 > **Python:** 3.10+  
 > **Backend path:** `D:\workspace\trade-workspace\workspace\backend-workspace\`  
-> **Database:** SQL Server (localhost:1433)  
+> **Mock Exchange path:** `D:\workspace\trade-workspace\workspace\mock-exchange-workspace\`  
+> **Database:** SQL Server (localhost:1433) + SQLite (mock exchange)  
 > **Message Broker:** Redis (Docker — Redis only, no Celery in Docker)  
 > **Celery:** Runs directly on Windows (faster, no Docker overhead)
 
@@ -12,14 +13,40 @@
 ## Architecture Overview
 
 ```
-SQL Server (localhost:1433)   ← runs natively on Windows
-Redis (Docker container)      ← only service in Docker
-FastAPI (uvicorn)             ← runs directly on Windows
-Celery Worker                 ← runs directly on Windows
-Celery Beat                   ← runs directly on Windows
+SQL Server (localhost:1433)         ← runs natively on Windows
+Redis (Docker container :6379)      ← only service in Docker
+Mock Exchange (FastAPI :8001)       ← algorithm validation service
+Backend API (FastAPI :8000)         ← main trading backend
+Data Pipeline (asyncio)             ← OHLCV / OB / Delta / Scoring
+Celery Worker                       ← trade execution tasks
+Frontend (Vite :5173)               ← React dashboard
 ```
 
 Docker is used **only for Redis**. Everything else runs natively on Windows for faster development and easier SQL Server connectivity.
+
+### Service Dependencies
+
+```
+Redis ──────────────────────────────────────────┐
+                                                │
+Mock Exchange (:8001) ─── audit events ─────────┤
+  ├── AuditConsumer   (Redis → SQLite)          │
+  ├── CandleFeed      (candle close → SL/TP)    │
+  └── TickerFeed      (price feed → PnL)        │
+                                                │
+Backend API (:8000) ────────────────────────────┤
+  ├── FastAPI REST + WebSocket                  │
+  ├── Data Pipeline (OHLCV/OB/Delta/Scoring)   │
+  ├── ScoringService → AuditClient → Redis      │
+  └── TradeExecutor  → Mock Exchange :8001      │
+                                                │
+Celery Worker ──────────────────────────────────┘
+  └── execute_trade tasks → Mock Exchange :8001
+
+Frontend (:5173)
+  └── Proxy → Backend API :8000
+              └── Proxy → Mock Exchange :8001
+```
 
 ---
 
@@ -360,29 +387,228 @@ curl -X PUT http://localhost:8000/api/config/exchange `
 
 ---
 
+## Mock Exchange Workspace Setup
+
+> Mock Exchange là service dùng cho **Algorithm Validation** — mô phỏng exchange thật, ghi audit log cho mọi signal và trade, cung cấp position tracking và real-time PnL.  
+> **Port:** 8001 | **DB:** SQLite (tự tạo) | **Bắt buộc** khi muốn dùng Trade Monitor UI
+
+### Mock Exchange — Step 1: Navigate
+
+```powershell
+cd D:\workspace\trade-workspace\workspace\mock-exchange-workspace
+```
+
+### Mock Exchange — Step 2: Create Virtual Environment
+
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
+python --version
+# Python 3.10.x
+```
+
+### Mock Exchange — Step 3: Install Dependencies
+
+```powershell
+# trading-core phải được cài trước (shared package)
+pip install -e ..\trading-core
+
+# Cài dependencies của mock exchange
+pip install -r requirements.txt
+```
+
+Nếu `aioredis` conflict:
+```powershell
+pip install -r requirements.txt --ignore-installed aioredis
+# redis>=5.0 đã có async support built-in
+```
+
+### Mock Exchange — Step 4: Verify Config
+
+File `config.yaml` đã có sẵn với defaults phù hợp:
+
+```yaml
+service:
+  host: "0.0.0.0"
+  port: 8001
+
+database:
+  url: "sqlite:///./mock_exchange.db"   # tự tạo khi khởi động
+
+redis:
+  url: "redis://localhost:6379/0"       # phải khớp với Redis đang chạy
+
+exchange:
+  id: "binance"
+  fee_rate: 0.001
+
+mock_account:
+  initial_balance_usd: 10000.0         # số dư tài khoản giả lập ban đầu
+
+price_feed:
+  ticker_poll_interval_seconds: 10     # cập nhật giá realtime mỗi 10s
+```
+
+> Không cần file `.env` — mọi config đều qua `config.yaml`.
+
+### Mock Exchange — Step 5: Start Service
+
+```powershell
+# Terminal riêng, với venv đã activate
+$env:PYTHONPATH = "D:\workspace\trade-workspace\workspace\trading-core;" + $env:PYTHONPATH
+.venv\Scripts\python main.py
+```
+
+Service khởi động tự động:
+1. Init SQLite DB (tạo 7 tables)
+2. Init mock account (balance $10,000)
+3. Start AuditConsumer (đọc `audit:pending_snapshots` từ Redis)
+4. Start CandleFeed (nhận candle_close → xử lý SL/TP)
+5. Start TickerFeed (poll giá Binance → cập nhật unrealized PnL)
+6. Start FastAPI/uvicorn trên port 8001
+
+Expected output:
+```
+INFO | Config loaded from .../config.yaml
+INFO | Database initialized: sqlite:////.../mock_exchange.db
+INFO | Mock account initialized with balance=10000.00 USD
+INFO | AuditConsumer started — listening on audit:pending_snapshots
+INFO | CandleFeed started
+INFO | TickerFeed started — polling binance every 10s
+INFO | Starting mock-exchange-workspace on 0.0.0.0:8001
+INFO | Application startup complete.
+```
+
+### Mock Exchange — Step 6: Verify
+
+```powershell
+# Health check
+curl http://localhost:8001/health
+# {"status":"ok","service":"mock-exchange-workspace"}
+
+# API docs
+# Mở browser: http://localhost:8001/docs
+```
+
+### Mock Exchange — Bảng dữ liệu (SQLite tự tạo)
+
+| Table | Mô tả |
+|-------|-------|
+| `mock_orders` | Lệnh đặt trên exchange giả lập |
+| `mock_positions` | Positions đang mở/đã đóng |
+| `mock_account` | Số dư, equity, margin |
+| `mock_account_history` | Lịch sử số dư |
+| `signal_audit_log` | Audit mọi signal từ backend |
+| `trade_audit_log` | Audit kết quả từng trade |
+| `no_signal_audit_log` | Cơ hội bị bỏ lỡ |
+
+### Mock Exchange — Kích hoạt trong Backend
+
+Sau khi mock exchange đang chạy, bật tích hợp trong `workspace/backend-workspace/config.yaml`:
+
+```yaml
+mock_exchange:
+  enabled: true            # ← đổi từ false thành true
+  url: "http://localhost:8001"
+  timeout_seconds: 5
+
+audit:
+  enabled: true            # ← đổi từ false thành true
+```
+
+> Sau khi đổi config, **hot-reload** bằng `POST http://localhost:8000/api/config/reload` — không cần restart backend.
+
+### Mock Exchange — WebSocket Endpoints
+
+| Endpoint | Mô tả |
+|----------|-------|
+| `WS ws://localhost:8001/ws/positions` | Real-time position prices + unrealized PnL |
+| `WS ws://localhost:8001/ws/audit-feed` | Real-time signal/trade audit events |
+
+> Frontend tự kết nối qua Backend proxy (`/api/exchange/*`, `/api/audit/*` tại :8000).
+
+### Mock Exchange — Troubleshooting
+
+**Issue: `ModuleNotFoundError: No module named 'trading_core'`**
+```powershell
+# Cài trading-core trước
+pip install -e ..\trading-core
+# Hoặc set PYTHONPATH
+$env:PYTHONPATH = "D:\workspace\trade-workspace\workspace\trading-core"
+```
+
+**Issue: SQLite database locked**
+```powershell
+# Xóa file DB để tạo lại từ đầu (mất toàn bộ audit history)
+Remove-Item mock_exchange.db
+.venv\Scripts\python main.py
+```
+
+**Issue: AuditConsumer không nhận events từ backend**
+```powershell
+# Kiểm tra Redis có messages không
+docker exec trading_redis redis-cli llen audit:pending_snapshots
+# Nếu > 0: AuditConsumer đang chờ xử lý
+# Nếu = 0: backend chưa gửi (kiểm tra audit.enabled = true trong config.yaml)
+```
+
+**Issue: TickerFeed không cập nhật giá**
+```powershell
+# Kiểm tra kết nối Binance
+curl "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+# Cần internet access, không cần API key (public endpoint)
+```
+
+---
+
 ## Full Startup Sequence
 
 Every time you start the system, run in this order:
 
 ```powershell
-# 1. Start Redis (Docker)
+# ── Terminal 0: Redis ─────────────────────────────
+cd D:\workspace\trade-workspace\workspace\backend-workspace
 docker-compose up -d
+# Verify: docker exec trading_redis redis-cli ping → PONG
 
-# 2. Activate venv
-.venv\Scripts\activate
+# ── Terminal 1: Mock Exchange :8001 ──────────────
+cd D:\workspace\trade-workspace\workspace\mock-exchange-workspace
+$env:PYTHONPATH = "D:\workspace\trade-workspace\workspace\trading-core;" + $env:PYTHONPATH
+.venv\Scripts\python main.py
 
-# 3. Start FastAPI (Terminal 1)
+# ── Terminal 2: Backend API :8000 ─────────────────
+cd D:\workspace\trade-workspace\workspace\backend-workspace
+# Load env vars
+Get-Content .env | ForEach-Object { if ($_ -match '^([^#][^=]*)=(.*)$') { [System.Environment]::SetEnvironmentVariable($matches[1].Trim(), $matches[2].Trim(), 'Process') } }
+$env:PYTHONPATH = "D:\workspace\trade-workspace\workspace\trading-core;" + $env:PYTHONPATH
 .venv\Scripts\uvicorn api.main:app --reload --port 8000
 
-# 4. Start Celery Worker (Terminal 2)
+# ── Terminal 3: Data Pipeline ─────────────────────
+cd D:\workspace\trade-workspace\workspace\backend-workspace
+$env:PYTHONPATH = "D:\workspace\trade-workspace\workspace\trading-core;" + $env:PYTHONPATH
+.venv\Scripts\python main.py
+
+# ── Terminal 4: Celery Worker ─────────────────────
+cd D:\workspace\trade-workspace\workspace\backend-workspace
+$env:PYTHONPATH = "D:\workspace\trade-workspace\workspace\trading-core;" + $env:PYTHONPATH
 .venv\Scripts\celery -A celery_app worker --loglevel=info -Q scoring,default --concurrency=2
 
-# 5. Start Celery Beat (Terminal 3)
+# ── Terminal 5: Celery Beat ───────────────────────
+cd D:\workspace\trade-workspace\workspace\backend-workspace
+$env:PYTHONPATH = "D:\workspace\trade-workspace\workspace\trading-core;" + $env:PYTHONPATH
 .venv\Scripts\celery -A celery_app beat --loglevel=info
 
-# 6. Start Frontend (Terminal 4 — see SETUP_FRONTEND.md)
-# cd D:\workspace\trade-workspace\workspace\frontend-workspace
-# npm run dev
+# ── Terminal 6: Frontend :5173 ────────────────────
+cd D:\workspace\trade-workspace\workspace\frontend-workspace
+npm run dev
+```
+
+> **Tip:** Dùng `.\start.ps1` ở thư mục gốc để tự động hoá toàn bộ quá trình trên.
+
+```powershell
+cd D:\workspace\trade-workspace
+.\start.ps1          # mở 6 windows tự động, health check từng service
+.\stop.ps1           # dừng tất cả
 ```
 
 ---
@@ -390,9 +616,14 @@ docker-compose up -d
 ## Shutdown
 
 ```powershell
-# Stop Celery: Ctrl+C in each terminal
+# Dừng tất cả bằng script (từ thư mục gốc)
+.\stop.ps1
 
-# Stop Redis
+# Hoặc thủ công:
+# Ctrl+C trong mỗi terminal (Mock Exchange, Backend API, Data Pipeline, Celery)
+
+# Dừng Redis (Docker)
+cd workspace\backend-workspace
 docker-compose down
 
 # Deactivate venv
@@ -455,24 +686,43 @@ with get_engine().connect() as conn:
 
 ## Quick Reference
 
+### Tất cả services (một lệnh)
 ```powershell
+# Từ thư mục gốc D:\workspace\trade-workspace
+.\start.ps1                              # start tất cả (dev mode)
+.\start.ps1 -SkipRedis                   # bỏ qua Redis nếu đang chạy
+.\start.ps1 -Services "backend-api,frontend"  # chỉ start một số service
+.\stop.ps1                               # dừng tất cả
+```
+
+### Backend workspace
+```powershell
+cd workspace\backend-workspace
+
 # Activate venv
 .venv\Scripts\activate
 
-# Start Redis only (Docker)
+# Start Redis (Docker)
 docker-compose up -d
 
-# Init database (first time only)
+# Init database — chỉ lần đầu
 .venv\Scripts\python db/init_db.py
 
-# Start FastAPI
+# Start FastAPI :8000
+$env:PYTHONPATH = "D:\workspace\trade-workspace\workspace\trading-core;" + $env:PYTHONPATH
 .venv\Scripts\uvicorn api.main:app --reload --port 8000
 
-# Start Celery Worker (new terminal)
+# Start Data Pipeline
+.venv\Scripts\python main.py
+
+# Start Celery Worker
 .venv\Scripts\celery -A celery_app worker --loglevel=info -Q scoring,default --concurrency=2
 
-# Start Celery Beat (new terminal)
+# Start Celery Beat
 .venv\Scripts\celery -A celery_app beat --loglevel=info
+
+# Hot-reload config (không cần restart)
+curl -X POST http://localhost:8000/api/config/reload
 
 # Run tests
 .venv\Scripts\python -m pytest tests/ -q
@@ -480,3 +730,37 @@ docker-compose up -d
 # Stop Redis
 docker-compose down
 ```
+
+### Mock Exchange workspace
+```powershell
+cd workspace\mock-exchange-workspace
+
+# Activate venv
+.venv\Scripts\activate
+
+# Install (lần đầu)
+pip install -e ..\trading-core
+pip install -r requirements.txt
+
+# Start service :8001
+$env:PYTHONPATH = "D:\workspace\trade-workspace\workspace\trading-core;" + $env:PYTHONPATH
+.venv\Scripts\python main.py
+
+# Health check
+curl http://localhost:8001/health
+
+# API docs
+# http://localhost:8001/docs
+
+# Xóa DB để reset toàn bộ audit data
+Remove-Item mock_exchange.db
+```
+
+### URLs sau khi tất cả services chạy
+
+| Service | URL | Mô tả |
+|---------|-----|-------|
+| Frontend | http://localhost:5173 | React Dashboard |
+| Backend API | http://localhost:8000/docs | FastAPI Swagger |
+| Mock Exchange | http://localhost:8001/docs | Mock Exchange Swagger |
+| Trade Monitor | http://localhost:5173/monitor | Positions + Orders + Audit |
