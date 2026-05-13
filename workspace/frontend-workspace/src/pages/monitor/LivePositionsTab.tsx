@@ -115,36 +115,55 @@ function PositionCard({ position }: { position: Position }) {
   )
 }
 
-// WebSocket hook for real-time position price updates
+// WebSocket hook for real-time position price updates.
+// Uses /ws-exchange proxy (vite.config.ts → ws://localhost:8001).
+// Reconnect logic uses a plain `connect()` function inside useEffect
+// — never calls the hook recursively (that violates Rules of Hooks).
 function usePositionsWebSocket() {
   const updatePositionFromWS = useMonitorStore((s) => s.updatePositionFromWS)
-  const wsRef = useRef<WebSocket | null>(null)
 
   useEffect(() => {
-    const ws = new WebSocket(`ws://${window.location.host.replace(':5173', ':8001')}/ws/positions`)
-    wsRef.current = ws
+    let unmounted = false
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+    let ws: WebSocket | null = null
+    let pingTimer: ReturnType<typeof setInterval> | null = null
 
-    ws.onmessage = (evt) => {
-      try {
-        const msg = JSON.parse(evt.data)
-        if (msg.type === 'positions' && Array.isArray(msg.data)) {
-          updatePositionFromWS(msg.data)
+    function connect() {
+      if (unmounted) return
+
+      // /ws-exchange is proxied by Vite → ws://localhost:8001
+      ws = new WebSocket(`ws://${window.location.host}/ws-exchange/ws/positions`)
+
+      ws.onmessage = (evt) => {
+        try {
+          const msg = JSON.parse(evt.data)
+          if (msg.type === 'positions' && Array.isArray(msg.data)) {
+            updatePositionFromWS(msg.data)
+          }
+        } catch { /* ignore malformed */ }
+      }
+
+      ws.onclose = () => {
+        if (!unmounted) {
+          // Schedule reconnect using plain function — NOT calling the hook again
+          reconnectTimer = setTimeout(connect, 3000)
         }
-      } catch { /* ignore malformed */ }
+      }
+
+      ws.onerror = () => ws?.close()
+
+      pingTimer = setInterval(() => {
+        if (ws?.readyState === WebSocket.OPEN) ws.send('{"type":"ping"}')
+      }, 25000)
     }
 
-    ws.onclose = () => {
-      // Reconnect after 3s on unexpected close
-      setTimeout(() => usePositionsWebSocket(), 3000)
-    }
-
-    const ping = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) ws.send('{"type":"ping"}')
-    }, 25000)
+    connect()
 
     return () => {
-      clearInterval(ping)
-      ws.close()
+      unmounted = true
+      if (reconnectTimer) clearTimeout(reconnectTimer)
+      if (pingTimer) clearInterval(pingTimer)
+      ws?.close()
     }
   }, [updatePositionFromWS])
 }

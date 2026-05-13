@@ -11,9 +11,18 @@ export default defineConfig({
         changeOrigin: true,
       },
       '/ws': {
+        // Backend API WebSocket (alerts, logs, portfolio)
         target: 'ws://localhost:8000',
         ws: true,
         changeOrigin: true,
+      },
+      '/ws-exchange': {
+        // Mock Exchange WebSocket (positions, audit-feed) at :8001
+        // Rewrite: /ws-exchange/ws/positions → /ws/positions on :8001
+        target: 'ws://localhost:8001',
+        ws: true,
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/ws-exchange/, ''),
       },
     },
   },
