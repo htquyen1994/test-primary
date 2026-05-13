@@ -10,7 +10,6 @@ function resultBadge(result: string | null, outcome?: string | null) {
     case 'win':
     case 'tp1_hit':
     case 'tp2_hit':
-    case 'win':
       return { label: '✅ WIN', cls: 'bg-green-900/40 text-green-400' }
     case 'loss':
     case 'sl_hit':
