@@ -409,18 +409,22 @@ python --version
 
 ### Mock Exchange — Step 3: Install Dependencies
 
+> **Lưu ý:** Mỗi dòng là một lệnh riêng biệt — chạy tuần tự, không ghép vào một dòng.
+
 ```powershell
-# trading-core phải được cài trước (shared package)
+# Kích hoạt venv trước (nếu chưa)
+.venv\Scripts\activate
+
+# Lệnh 1: cài trading-core (shared package — bắt buộc, chạy trước)
 pip install -e ..\trading-core
 
-# Cài dependencies của mock exchange
+# Lệnh 2: cài dependencies của mock-exchange-workspace
 pip install -r requirements.txt
 ```
 
-Nếu `aioredis` conflict:
+Nếu `aioredis` conflict với `redis>=5.0`:
 ```powershell
 pip install -r requirements.txt --ignore-installed aioredis
-# redis>=5.0 đã có async support built-in
 ```
 
 ### Mock Exchange — Step 4: Verify Config
@@ -738,9 +742,9 @@ cd workspace\mock-exchange-workspace
 # Activate venv
 .venv\Scripts\activate
 
-# Install (lần đầu)
-pip install -e ..\trading-core
-pip install -r requirements.txt
+# Install (lần đầu — chạy từng lệnh riêng biệt)
+pip install -e ..\trading-core      # lệnh 1
+pip install -r requirements.txt     # lệnh 2
 
 # Start service :8001
 $env:PYTHONPATH = "D:\workspace\trade-workspace\workspace\trading-core;" + $env:PYTHONPATH
