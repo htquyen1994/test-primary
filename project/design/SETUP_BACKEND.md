@@ -116,7 +116,7 @@ cd D:\workspace\trade-workspace\workspace\backend-workspace
 python -m venv .venv
 
 # Activate
-.venv\Scripts\activate
+.\.venv\Scripts\activate
 
 # Verify — should show Python 3.10.x
 python --version
@@ -303,7 +303,7 @@ Celery runs **directly on Windows** — no Docker needed. Open **two separate Po
 
 ```powershell
 cd D:\workspace\trade-workspace\workspace\backend-workspace
-.venv\Scripts\activate
+.\.venv\Scripts\activate
 
 # Start worker — listens on 'scoring' and 'default' queues
 .venv\Scripts\celery -A celery_app worker --loglevel=info -Q scoring,default --concurrency=2
@@ -331,7 +331,7 @@ Expected output:
 
 ```powershell
 cd D:\workspace\trade-workspace\workspace\backend-workspace
-.venv\Scripts\activate
+.\.venv\Scripts\activate
 
 # Start beat scheduler
 .venv\Scripts\celery -A celery_app beat --loglevel=info
@@ -402,7 +402,7 @@ cd D:\workspace\trade-workspace\workspace\mock-exchange-workspace
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\activate
+.\.venv\Scripts\activate
 python --version
 # Python 3.10.x
 ```
@@ -413,7 +413,7 @@ python --version
 
 ```powershell
 # Kích hoạt venv trước (nếu chưa)
-.venv\Scripts\activate
+.\.venv\Scripts\activate
 
 # Lệnh 1: cài trading-core (shared package — bắt buộc, chạy trước)
 pip install -e ..\trading-core
@@ -640,7 +640,7 @@ deactivate
 
 ### Issue: `ModuleNotFoundError: No module named 'numpy'`
 ```powershell
-.venv\Scripts\activate
+.\.venv\Scripts\activate
 .venv\Scripts\pip install numpy pandas
 ```
 
@@ -704,7 +704,7 @@ with get_engine().connect() as conn:
 cd workspace\backend-workspace
 
 # Activate venv
-.venv\Scripts\activate
+.\.venv\Scripts\activate
 
 # Start Redis (Docker)
 docker-compose up -d
@@ -740,7 +740,7 @@ docker-compose down
 cd workspace\mock-exchange-workspace
 
 # Activate venv
-.venv\Scripts\activate
+.\.venv\Scripts\activate
 
 # Install (lần đầu — chạy từng lệnh riêng biệt)
 pip install -e ..\trading-core      # lệnh 1
