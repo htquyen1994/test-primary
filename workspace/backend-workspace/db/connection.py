@@ -8,6 +8,6 @@ All new code should import directly from trading_core:
     from trading_core.db import get_engine, get_session_factory, get_session, Base
 """
 
-from trading_core.db import get_engine, get_session_factory, get_session, Base
+from trading_core.db import get_engine, get_session_factory, get_session, Base, get_database_url
 
-__all__ = ["get_engine", "get_session_factory", "get_session", "Base"]
+__all__ = ["get_engine", "get_session_factory", "get_session", "Base", "get_database_url"]
