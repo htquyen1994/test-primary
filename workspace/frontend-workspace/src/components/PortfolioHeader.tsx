@@ -53,6 +53,8 @@ export function PortfolioHeader() {
           <span className="text-gray-700">|</span>
           <a href="/config/exchange" className="text-gray-400 hover:text-white transition-colors text-xs">Exchange</a>
           <a href="/config/trading" className="text-gray-400 hover:text-white transition-colors text-xs">Params</a>
+          <span className="text-gray-700">|</span>
+          <a href="/help" className="text-gray-400 hover:text-white transition-colors text-xs">❓ Help</a>
         </nav>
       </div>
     </header>
