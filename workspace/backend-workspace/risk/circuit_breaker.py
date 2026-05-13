@@ -150,7 +150,16 @@ class CircuitBreaker:
                 time_remaining_seconds=time_remaining,
             )
         except Exception as exc:
-            logger.error("CircuitBreaker.get_lock_info error: %s", exc)
+            # Downgrade SQL "table not found" (42S02) to WARNING — migration 003
+            # hasn't been run yet. All other errors remain as ERROR.
+            exc_str = str(exc)
+            if "42S02" in exc_str or "circuit_breaker_state" in exc_str:
+                logger.warning(
+                    "CircuitBreaker table missing — run `python db/init_db.py` "
+                    "to apply migration 003. Treating as unlocked."
+                )
+            else:
+                logger.error("CircuitBreaker.get_lock_info error: %s", exc)
             return LockInfo(is_locked=False)
         finally:
             db.close()

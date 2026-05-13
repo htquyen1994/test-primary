@@ -350,10 +350,13 @@ class ScoringService:
                 order_book_available=order_book_available,
             ))
 
-            # Apply filter score adjustments (sum of all filter adjustments)
+            # Apply filter score adjustments (sum of all filter adjustments).
+            # filter_extras values are plain dicts (from FilterResult.to_dict()),
+            # so use .get() — NOT attribute access.
             total_score_adj = sum(
-                r.score_adjustment for r in filter_extras.values()
-                if isinstance(r, dict) and r.get("score_adjustment", 0) != 0
+                r.get("score_adjustment", 0)
+                for r in filter_extras.values()
+                if isinstance(r, dict)
             )
             if total_score_adj != 0:
                 adjusted_final = max(0, min(100, score.final_score + int(total_score_adj)))
