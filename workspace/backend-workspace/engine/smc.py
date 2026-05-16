@@ -29,11 +29,14 @@ from indicators.atr import ATR
 logger = logging.getLogger(__name__)
 
 # Minimum impulse body as multiple of ATR to qualify as OB trigger
-OB_ATR_MULTIPLIER = 1.5
+# Reduced from 1.5 → 1.0: at 1.5x only 1/50 candles qualified in live data (debug 2026-05-16)
+OB_ATR_MULTIPLIER = 1.0
 # Lookback window for swing high/low detection
-SWING_LOOKBACK = 20
+# Reduced from 20 → 15: tighter window captures more recent structure
+SWING_LOOKBACK = 15
 # Tolerance for FVG midpoint touch (% of price)
-FVG_TOUCH_TOLERANCE = 0.001  # 0.1%
+# Increased from 0.1% → 0.3%: FVG midpoint was 0.184% away but tolerance was only 0.1% (debug 2026-05-16)
+FVG_TOUCH_TOLERANCE = 0.003  # 0.3%
 # Tolerance for OB retest (price must be within OB zone)
 OB_RETEST_TOLERANCE = 0.002  # 0.2% beyond OB boundary
 
@@ -78,10 +81,15 @@ class FairValueGap:
     candle_index: int
     filled: bool = False
 
-    def is_price_at_midpoint(self, current_price: float) -> bool:
-        """Returns True if price is within tolerance of the FVG midpoint."""
-        tolerance = self.mid * FVG_TOUCH_TOLERANCE
-        return abs(current_price - self.mid) <= tolerance
+    def is_price_at_midpoint(self, current_price: float,
+                              tolerance: Optional[float] = None) -> bool:
+        """
+        Returns True if price is within tolerance of the FVG midpoint.
+        tolerance: fraction of price (e.g. 0.003 = 0.3%).
+                   Falls back to FVG_TOUCH_TOLERANCE module constant if not provided.
+        """
+        tol = tolerance if tolerance is not None else FVG_TOUCH_TOLERANCE
+        return abs(current_price - self.mid) <= self.mid * tol
 
     def check_if_filled(self, candle: pd.Series) -> None:
         """Mark FVG as filled when price trades through the full gap."""
@@ -408,17 +416,17 @@ def detect_choch(ohlcv: pd.DataFrame, lookback: int = SWING_LOOKBACK) -> Optiona
     last_close = float(last_candle["close"])
     last_idx = n - 1
 
-    # Bullish CHoCH: close breaks above swing high with 0.1% momentum buffer
-    # Prevents false signals from candles that barely graze the swing level.
-    if last_close > swing_high * (1 + 0.001):
+    # Bullish CHoCH: close breaks above swing high with 0.05% momentum buffer
+    # Reduced from 0.1% → 0.05%: 0.1% was too strict, price rarely broke out cleanly (debug 2026-05-16)
+    if last_close > swing_high * (1 + 0.0005):
         return CHoCH(
             direction="bullish",
             break_price=swing_high,
             candle_index=last_idx,
         )
 
-    # Bearish CHoCH: close breaks below swing low with 0.1% momentum buffer
-    if last_close < swing_low * (1 - 0.001):
+    # Bearish CHoCH: close breaks below swing low with 0.05% momentum buffer
+    if last_close < swing_low * (1 - 0.0005):
         return CHoCH(
             direction="bearish",
             break_price=swing_low,
@@ -445,6 +453,8 @@ def compute_smc_score(
     atr_multiplier: float = OB_ATR_MULTIPLIER,
     signal_direction: str = "long",
     htf_bias: Optional[str] = None,
+    fvg_tolerance: Optional[float] = None,
+    swing_lookback: Optional[int] = None,
 ) -> SMCResult:
     """
     Compute the SMC module score (max 30 pts).
@@ -457,16 +467,24 @@ def compute_smc_score(
     Args:
         ohlcv_15m:        15-minute OHLCV DataFrame (trigger timeframe)
         ohlcv_1h:         1-hour OHLCV DataFrame (context timeframe)
-        atr_multiplier:   Minimum impulse body as multiple of ATR
+        atr_multiplier:   Minimum impulse body as multiple of ATR. Reads from
+                          trading_params.ob_atr_multiplier (default: OB_ATR_MULTIPLIER)
         signal_direction: "long" or "short" — only matching OBs are scored.
-                          Bullish OBs act as support for longs;
-                          Bearish OBs act as resistance for shorts.
+        fvg_tolerance:    FVG midpoint touch tolerance as fraction of price.
+                          Reads from trading_params.fvg_touch_tolerance_pct
+                          (default: FVG_TOUCH_TOLERANCE = 0.003)
+        swing_lookback:   Swing high/low lookback window.
+                          Reads from trading_params.swing_lookback
+                          (default: SWING_LOOKBACK = 15)
 
     Returns:
         SMCResult with score and detected patterns
 
     Satisfies: Requirement 6.2 (SMC component)
     """
+    # Use caller-provided values (from DB trading_params) or fall back to module constants
+    _fvg_tol = fvg_tolerance if fvg_tolerance is not None else FVG_TOUCH_TOLERANCE
+    _lookback = swing_lookback if swing_lookback is not None else SWING_LOOKBACK
     result = SMCResult()
 
     if ohlcv_15m.empty or len(ohlcv_15m) < 5:
@@ -479,8 +497,8 @@ def compute_smc_score(
         detect_htf_bias(ohlcv_1h) if not ohlcv_1h.empty else "neutral"
     )
 
-    # 2. CHoCH detection
-    choch = detect_choch(ohlcv_15m)
+    # 2. CHoCH detection — use configurable swing_lookback
+    choch = detect_choch(ohlcv_15m, lookback=_lookback)
     result.choch = choch
     if choch and _aligned_with_bias(choch.direction, result.htf_bias):
         result.choch_aligned = True
@@ -501,10 +519,10 @@ def compute_smc_score(
             result.score += 10.0
             break  # score only once even if multiple OBs are retested
 
-    # 4. FVG midpoint touch
+    # 4. FVG midpoint touch — use configurable fvg_tolerance
     fvg = find_fvg(ohlcv_15m)
     result.fvg = fvg
-    if fvg and not fvg.filled and fvg.is_price_at_midpoint(current_price):
+    if fvg and not fvg.filled and fvg.is_price_at_midpoint(current_price, tolerance=_fvg_tol):
         result.fvg_touched = True
         result.score += 10.0
 

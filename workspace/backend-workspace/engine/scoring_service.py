@@ -216,12 +216,33 @@ class ScoringService:
             from engine.smc import detect_htf_bias as _detect_htf_bias
             htf_bias = _detect_htf_bias(_ohlcv_1h_or_15m) if not _ohlcv_1h_or_15m.empty else "neutral"
 
+            # Load SMC params from DB trading_params (priority: DB > module constants)
+            _smc_atr_mult = None
+            _smc_fvg_tol  = None
+            _smc_swing    = None
+            try:
+                from db.connection import get_session_factory
+                from config.config_service import get_active_trading_params
+                _db = get_session_factory()()
+                try:
+                    _tp = get_active_trading_params(_db)
+                finally:
+                    _db.close()
+                _smc_atr_mult = _tp.get("ob_atr_multiplier")
+                _smc_fvg_tol  = _tp.get("fvg_touch_tolerance_pct")
+                _smc_swing    = _tp.get("swing_lookback")
+            except Exception as _e:
+                logger.debug("SMC params from DB unavailable (%s) — using module constants", _e)
+
             # Pass 1: detect CHoCH to derive signal direction (uses pre-computed htf_bias)
-            _smc_raw = compute_smc_score(ohlcv, _ohlcv_1h_or_15m, htf_bias=htf_bias)
+            _smc_raw = compute_smc_score(
+                ohlcv, _ohlcv_1h_or_15m, htf_bias=htf_bias,
+                atr_multiplier=_smc_atr_mult or 1.0,
+                fvg_tolerance=_smc_fvg_tol,
+                swing_lookback=_smc_swing,
+            )
 
             # Derive signal direction from CHoCH + HTF bias.
-            # Short only when CHoCH breaks below a swing low (bearish)
-            # AND 1H trend is also bearish — dual confirmation prevents false shorts.
             if (
                 _smc_raw.choch is not None
                 and _smc_raw.choch.direction == "bearish"
@@ -231,9 +252,14 @@ class ScoringService:
             else:
                 signal_direction = "long"
 
-            # Pass 2: rescore with direction-aware OB filter so bearish OBs are
-            # not awarded +10 pts for long signals (they are resistance, not support).
-            smc = compute_smc_score(ohlcv, _ohlcv_1h_or_15m, signal_direction=signal_direction, htf_bias=htf_bias)
+            # Pass 2: rescore with direction-aware OB filter
+            smc = compute_smc_score(
+                ohlcv, _ohlcv_1h_or_15m,
+                signal_direction=signal_direction, htf_bias=htf_bias,
+                atr_multiplier=_smc_atr_mult or 1.0,
+                fvg_tolerance=_smc_fvg_tol,
+                swing_lookback=_smc_swing,
+            )
 
             # Compute nearest S/R distance from detected OB + FVG boundaries.
             # Used by compute_context_score to award +3 pts when price is away from S/R.
