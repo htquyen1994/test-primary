@@ -158,13 +158,67 @@ with get_connection() as conn:
 
         sep("TODAY — DATA QUALITY CHECK", w=50)
         of_zero = sum(1 for r in rows if r.score_order_flow == 0)
+        # Score cap: only signals with OF=0 AND final_score > 60 are violations
+        # (signal scored > 60 despite no OB data — cap not enforced)
         cap_violated = sum(1 for r in rows if r.final_score > 60 and r.score_order_flow == 0)
         print(f"  Signals with Order Flow = 0:   {of_zero}/{len(rows)} ({of_zero/len(rows)*100:.0f}%)")
-        print(f"  Score > 60 but OF = 0:         {cap_violated}  (should be 0)")
-        if cap_violated > 0:
-            print(f"  !! DATA QUALITY CAP NOT ENFORCED for {cap_violated} signals")
+        if of_zero == len(rows):
+            print(f"  !! ALL signals OF=0 — OrderBook/DeltaService not running or no data yet")
+        elif of_zero > len(rows) * 0.5:
+            print(f"  !! > 50% OF=0 — OB feed may be intermittent")
         else:
-            print(f"  Data quality cap: OK")
+            print(f"  OB feed: healthy ({100 - of_zero/len(rows)*100:.0f}% signals have OF data)")
+        print(f"  Score > 60 with OF = 0:        {cap_violated}  {'<< CAP VIOLATED' if cap_violated > 0 else '(OK)'}")
+
+    # ── Filter Pipeline Analysis (Step 1B from MASTER_AUDIT_PROMPT) ───────────
+    if rows:
+        sep("TODAY — FILTER PIPELINE ANALYSIS", w=50)
+        # Note: blocking reason stored in logs:channel (Redis) not in signal_log DB
+        # We can infer from score patterns:
+        # - final_score = 0 AND classification = IGNORE → likely blocked by filter
+        # - final_score > 0 → passed all filters, scored normally
+        blocked_zero = sum(1 for r in rows if r.final_score == 0 and r.classification == 'IGNORE')
+        scored = len(rows) - blocked_zero
+        print(f"  Signals that reached scoring:  {scored}/{len(rows)} ({scored/len(rows)*100:.0f}%)")
+        print(f"  Signals blocked (score=0):     {blocked_zero}/{len(rows)} ({blocked_zero/len(rows)*100:.0f}%)")
+        if blocked_zero / max(len(rows), 1) > 0.6:
+            print(f"  !! > 60% blocked — check MTF filter / circuit breaker state")
+        print(f"  Note: Detailed block reasons (MTF_BLOCK/BTC_GUARD/CB_LOCKED)")
+        print(f"        visible in Redis logs:channel or backend Data Pipeline terminal")
+
+    # ── Score Trend (Step 1D from MASTER_AUDIT_PROMPT) ────────────────────────
+    if rows:
+        sep("TODAY — SCORE TREND vs HISTORY", w=50)
+        today_avg = sum(float(r.final_score) for r in rows) / len(rows)
+        today_of  = sum(float(r.score_order_flow) for r in rows) / len(rows)
+        # Yesterday
+        rows_y = conn.execute(text("""
+            SELECT AVG(CAST(final_score AS FLOAT)) avg_f,
+                   AVG(CAST(score_order_flow AS FLOAT)) avg_of,
+                   COUNT(*) cnt
+            FROM signal_log
+            WHERE asset IN ('BTC/USDT','ETH/USDT','SOL/USDT')
+              AND CAST(timestamp AS DATE) = CAST(DATEADD(DAY,-1,GETUTCDATE()) AS DATE)
+        """)).fetchone()
+        rows_7d = conn.execute(text("""
+            SELECT AVG(CAST(final_score AS FLOAT)) avg_f,
+                   AVG(CAST(score_order_flow AS FLOAT)) avg_of,
+                   COUNT(*) cnt
+            FROM signal_log
+            WHERE asset IN ('BTC/USDT','ETH/USDT','SOL/USDT')
+              AND timestamp >= DATEADD(DAY,-7,GETUTCDATE())
+        """)).fetchone()
+        yd_avg = rows_y.avg_f or 0
+        yd_of  = rows_y.avg_of or 0
+        w7_avg = rows_7d.avg_f or 0
+        w7_of  = rows_7d.avg_of or 0
+        trend_f  = "↑" if today_avg > yd_avg else ("↓" if today_avg < yd_avg else "→")
+        trend_of = "↑" if today_of  > yd_of  else ("↓" if today_of  < yd_of  else "→")
+        print(f"  {'Metric':<20} {'Today':>8} {'D-1':>8} {'7d avg':>8} {'Trend':>6}")
+        print(f"  {'-'*20} {'-'*8} {'-'*8} {'-'*8} {'-'*6}")
+        print(f"  {'Avg final score':<20} {today_avg:>8.1f} {yd_avg:>8.1f} {w7_avg:>8.1f} {trend_f:>6}")
+        print(f"  {'Avg OF score':<20} {today_of:>8.2f} {yd_of:>8.2f} {w7_of:>8.2f} {trend_of:>6}")
+        print(f"  {'Signal count':<20} {len(rows):>8} {rows_y.cnt or 0:>8} {rows_7d.cnt//7 if rows_7d.cnt else 0:>8}/day")
     else:
         sep("NO SIGNALS TODAY — RECENT 20 SIGNALS", w=50)
         rows = conn.execute(text("""

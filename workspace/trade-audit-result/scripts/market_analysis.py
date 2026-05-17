@@ -92,22 +92,50 @@ def bias_daily(df):
     return "NEUTRAL"
 
 def bias_1h(df):
+    """
+    1H bias — mirrors detect_htf_bias() in engine/smc.py.
+    Uses swing structure (higher highs/lows), NOT EMA20/50.
+    EMA200 as primary trend filter, swing for confirmation.
+
+    FIX 2026-05-16: Previous version used EMA20/EMA50 which does NOT match
+    the system's actual context filter (engine/context.py uses detect_htf_bias).
+    """
     if len(df) < 50: return "neutral"
-    e20 = ema(df['close'], 20).iloc[-1]
-    e50 = ema(df['close'], 50).iloc[-1]
+    # Primary: EMA200 position (same as system's detect_htf_bias)
+    e200_series = ema(df['close'], 200)
+    if e200_series.isna().all(): return "neutral"
+    e200 = e200_series.iloc[-1]
     p = df['close'].iloc[-1]
-    if p > e20 > e50: return "bullish"
-    if p < e20 < e50: return "bearish"
+
+    # Swing structure check (last SWING_LOOKBACK candles)
+    lookback = min(15, len(df) - 1)
+    recent = df.iloc[-lookback - 1:-1]
+    lows  = recent['low'].values
+    highs = recent['high'].values
+    higher_lows  = sum(1 for i in range(1, len(lows))  if lows[i]  > lows[i-1])
+    lower_highs  = sum(1 for i in range(1, len(highs)) if highs[i] < highs[i-1])
+    n_pairs = len(lows) - 1
+
+    if p > e200 and higher_lows >= 0.6 * n_pairs: return "bullish"
+    if p < e200 and lower_highs >= 0.6 * n_pairs: return "bearish"
+    if p > e200: return "bullish"   # price above EMA200 as fallback
+    if p < e200: return "bearish"
     return "neutral"
 
+
 def mtf_scenario(b4h, b1h, direction):
-    aligned = (direction == "long" and b4h == "bullish" and b1h == "bullish") or \
-              (direction == "short" and b4h == "bearish" and b1h == "bearish")
-    opposing = (direction == "long" and b4h == "bearish") or \
-               (direction == "short" and b4h == "bullish")
-    if aligned:  return "A", 1.0, +10
-    if opposing: return "C", 0.0, "BLOCK"
-    return "B", 0.5, -10
+    """
+    MTF Scenario A/B/C — mirrors get_mtf_alignment() in engine/mtf_bias.py.
+    Scenario C: 4H directly opposing signal direction (ADX > 20 implied by detect_4h_bias).
+    FIX 2026-05-16: Removed erroneous explicit ADX > 25 check — the ADX filter
+    is already embedded inside detect_4h_bias()/bias_4h() which returns "bearish"
+    only when ADX > ADX_TRENDING_THRESHOLD (20).
+    """
+    signal_bias   = "bullish" if direction == "long" else "bearish"
+    opposite_bias = "bearish" if signal_bias == "bullish" else "bullish"
+    if b4h == opposite_bias: return "C", 0.0, "BLOCK"  # 4H opposing → BLOCK
+    if b4h == signal_bias:   return "A", 1.0, +10      # 4H aligned
+    return "B", 0.5, -10                                # 4H ranging
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -152,16 +180,60 @@ def analyze(exchange, symbol):
     print(f"  BB position: {bb_pct:.0f}% (0=lower, 100=upper)")
     print(f"  Price {'ABOVE' if price > e200 else 'BELOW'} EMA200 1H")
 
-    # Max score estimate
-    ctx_pts = 12 if (direction == "long" and b1 == "bullish") or (direction == "short" and b1 == "bearish") else 4
-    raw_best = 0 + 30 + 20 + ctx_pts + 15  # OF=0, SMC=30, VSA=20
+    # OB feed status — check Redis (non-blocking, fallback to unknown)
+    ob_available = False
+    try:
+        import sys as _sys, os as _os
+        _sys.path.insert(0, str(Path(__file__).parent.parent.parent / "trading-core"))
+        from pathlib import Path as _Path
+        _env = _Path(__file__).parent.parent.parent / "backend-workspace" / ".env"
+        if _env.exists():
+            for _line in _env.read_text().splitlines():
+                _line = _line.strip()
+                if _line and not _line.startswith('#') and '=' in _line:
+                    _k, _, _v = _line.partition('=')
+                    _os.environ.setdefault(_k.strip(), _v.strip())
+        import redis as _redis_lib, json as _json, time as _time
+        _r = _redis_lib.Redis(host='localhost', port=6379, decode_responses=True)
+        _binance_sym = symbol.replace('/', '')  # BTC/USDT → BTCUSDT
+        _snap = _r.get(f'ob:{symbol}:snap')    # try ccxt-style key first
+        if not _snap:
+            _snap = _r.get(f'ob:{_binance_sym}:snap')
+        if _snap:
+            _ob = _json.loads(_snap)
+            _age = _time.time() - _ob.get('updated_at', 0)
+            ob_available = _age <= 60 and (_ob.get('bid_stack', 0) > 0)
+    except Exception:
+        ob_available = False  # Redis not accessible in this context
+
+    # Max score estimate (realistic, not theoretical max)
+    # SMC realistic best: CHoCH+OB+FVG = 30, but usually 10-20
+    # VSA realistic best: NoSupply+EvR = 20, sometimes +POC = 30
+    # Context: 1H aligned=8, funding=4, S/R=3 → max 15; realistic with bias aligned = 11
+    ctx_pts = 11 if direction in ("long", "short") else 4  # 8 bias + funding 3 (S/R uncertain)
+    of_pts  = 25 if ob_available else 0   # bid+absorption possible; delta may be partial
+    raw_best = of_pts + 30 + 20 + ctx_pts + 15  # SMC=30, VSA=20 (optimistic)
     final_best = min(round(raw_best * mult / 125 * 100), 100)
-    final_best = min(final_best, 60)  # data quality cap
-    print(f"\n  Max achievable score (no OB feed): {final_best}/100 | ALERT threshold: 75")
+
+    # Apply MTF score adjustment
+    if direction != "neutral":
+        sc, _, sa = mtf_scenario(b4, b1, direction)
+        if sc == "A": final_best = min(100, final_best + 10)
+        elif sc == "B": final_best = max(0, final_best - 10)
+        elif sc == "C": final_best = 0
+
+    # Apply data quality cap
+    if not ob_available:
+        final_best = min(final_best, 60)
+
+    ob_status = f"{'OK' if ob_available else 'MISS'}"
+    print(f"\n  OB Feed: {ob_status} | Max score: {final_best}/100 | ALERT threshold: 75")
     if final_best >= 75:
-        print(f"  => ALERT POSSIBLE if SMC/VSA conditions met")
+        print(f"  => ALERT POSSIBLE — conditions: SMC CHoCH + OB retest + FVG touch needed")
+    elif final_best >= 55:
+        print(f"  => WATCH possible, ALERT needs: {'OB data' if not ob_available else 'better SMC/VSA conditions'}")
     else:
-        print(f"  => Need Order Book feed to reach ALERT")
+        print(f"  => IGNORE range — {'start OB feed' if not ob_available else 'market conditions unfavorable'}")
 
     return {"symbol": symbol, "price": price, "regime": reg, "daily": bd, "4h": b4, "1h": b1,
             "rsi": rsi_v, "adx": adx_15, "max_score": final_best, "direction": direction}
