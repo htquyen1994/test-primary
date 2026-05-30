@@ -1,0 +1,62 @@
+
+####################################################################
+  LIVE MARKET ANALYSIS — 2026-05-17 12:14 UTC
+####################################################################
+
+====================================================================
+  BTC/USDT
+====================================================================
+  Price: $78,402.7000 | 2026-05-17 12:00 UTC
+
+  REGIME: TRENDING (×1.0) | ADX(1H)=33.0 | ATR ratio=1.06x
+  MTF BIAS: Daily=NEUTRAL | 4H=ranging | 1H=bearish
+  SHORT → Scenario B | size ×0.5 | score adj: -10
+
+  RSI(15m)=63.2 | ADX(15m)=26.9 | EMA200(1H)=$79,744
+  BB position: 78% (0=lower, 100=upper)
+  Price BELOW EMA200 1H
+
+  OB Feed: MISS | Max score: 51/100 | ALERT threshold: 75
+  => IGNORE range — start OB feed
+
+====================================================================
+  ETH/USDT
+====================================================================
+  Price: $2,192.4000 | 2026-05-17 12:00 UTC
+
+  REGIME: TRENDING (×1.0) | ADX(1H)=30.7 | ATR ratio=1.01x
+  MTF BIAS: Daily=BEAR | 4H=ranging | 1H=bearish
+  SHORT → Scenario B | size ×0.5 | score adj: -10
+
+  RSI(15m)=60.2 | ADX(15m)=21.8 | EMA200(1H)=$2,257
+  BB position: 76% (0=lower, 100=upper)
+  Price BELOW EMA200 1H
+
+  OB Feed: MISS | Max score: 51/100 | ALERT threshold: 75
+  => IGNORE range — start OB feed
+
+====================================================================
+  SOL/USDT
+====================================================================
+  Price: $86.9100 | 2026-05-17 12:00 UTC
+
+  REGIME: TRENDING (×1.0) | ADX(1H)=34.1 | ATR ratio=0.94x
+  MTF BIAS: Daily=BEAR | 4H=ranging | 1H=bearish
+  SHORT → Scenario B | size ×0.5 | score adj: -10
+
+  RSI(15m)=54.5 | ADX(15m)=24.2 | EMA200(1H)=$91
+  BB position: 66% (0=lower, 100=upper)
+  Price BELOW EMA200 1H
+
+  OB Feed: MISS | Max score: 51/100 | ALERT threshold: 75
+  => IGNORE range — start OB feed
+
+
+####################################################################
+  SUMMARY
+####################################################################
+  Symbol              Price Regime       Daily    4H         1H            RSI  MaxScore
+  ------------ ------------ ------------ -------- ---------- ---------- ------ ---------
+  BTC/USDT     $  78,402.70 TRENDING     NEUTRAL  ranging    bearish      63.2       51/100
+  ETH/USDT     $   2,192.40 TRENDING     BEAR     ranging    bearish      60.2       51/100
+  SOL/USDT     $      86.91 TRENDING     BEAR     ranging    bearish      54.5       51/100

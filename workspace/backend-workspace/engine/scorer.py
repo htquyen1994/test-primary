@@ -35,7 +35,7 @@ DEFAULT_WATCH_THRESHOLD = 55
 @dataclass
 class ScoreInput:
     """All module scores fed into the Signal Scorer."""
-    order_flow: float = 0.0     # 0–35 pts
+    order_flow: float = 0.0     # 0–35 pts (already weight-adjusted by caller)
     smc: float = 0.0            # 0–30 pts
     vsa: float = 0.0            # 0–30 pts
     context: float = 0.0        # 0–15 pts
@@ -45,6 +45,9 @@ class ScoreInput:
     regime: str = "RANGING"     # for PARABOLIC short suppression
     # Data quality flags — used to cap score when critical modules are missing
     order_book_available: bool = True   # False when bid_stack == ask_stack == 0
+    # Dynamic denominator — set when module weight multipliers are applied.
+    # Defaults to MAX_RAW_SCORE (125) for backward compatibility.
+    max_raw: float = 0.0        # 0 → use MAX_RAW_SCORE constant
 
 
 @dataclass
@@ -131,8 +134,11 @@ class SignalScorer:
         raw = of_score + smc_score + vsa_score + ctx_score + bonus
 
         # Apply regime multiplier and normalize to [0, 100] (Req 6.3)
+        # Use caller-supplied max_raw when weights were applied (non-zero),
+        # otherwise fall back to the module constant (backward compatible).
+        denominator = inputs.max_raw if inputs.max_raw > 0 else MAX_RAW_SCORE
         multiplier = max(0.0, min(inputs.regime_multiplier, 1.0))
-        final = min(round(raw * multiplier / MAX_RAW_SCORE * 100), 100)
+        final = min(round(raw * multiplier / denominator * 100), 100)
         final = max(0, final)  # ensure non-negative
 
         # --- Data quality cap (Task 30.4) ---

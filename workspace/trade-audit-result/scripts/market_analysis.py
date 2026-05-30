@@ -6,7 +6,13 @@ Run: python market_analysis.py
 """
 
 import sys
+import io
 from pathlib import Path
+# Fix Windows console encoding for Unicode symbols
+if hasattr(sys.stdout, 'buffer'):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'buffer'):
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "backend-workspace"))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "trading-core"))

@@ -165,11 +165,13 @@ class OHLCVService:
                     lambda: exchange.fetch_ohlcv(symbol, timeframe, limit=10),
                 )
 
+                last_seen = self._last_ts.get(key, 0)
                 for candle in candles[:-1]:  # skip last (still forming)
                     ts = candle[0]
-                    if self._last_ts.get(key) == ts:
+                    if ts <= last_seen:  # already processed (equality OR older)
                         continue
-                    self._last_ts[key] = ts
+                    last_seen = ts           # track locally within loop
+                    self._last_ts[key] = ts  # persist for next poll
 
                     o, h, l, c, v = candle[1], candle[2], candle[3], candle[4], candle[5]
                     candle_dict = {

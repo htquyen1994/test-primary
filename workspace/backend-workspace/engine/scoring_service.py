@@ -33,12 +33,18 @@ class ScoringService:
     Runs in a background thread to avoid blocking the event loop.
     """
 
+    # Refresh trading-params cache every N candle events to avoid hitting DB each time.
+    _TP_CACHE_TTL = 30   # refresh after 30 candle events
+
     def __init__(self, config=None, audit_client=None) -> None:
         self._loop = None
         self._config = config  # ConfigSystem instance; None → use module-level defaults
         self._audit_client = audit_client
         from engine.correlation_manager import CorrelationManager
         self._correlation_manager = CorrelationManager()
+        # Trading-params cache (weights, thresholds) — refreshed periodically
+        self._tp_cache: dict = {}
+        self._tp_cache_counter: int = 0
 
     def _get_redis(self):
         return get_redis()
@@ -64,6 +70,11 @@ class ScoringService:
                         "Candle closed: %s %s @ %.4f — scoring...",
                         symbol, timeframe, close,
                     )
+                    # Update heartbeat (TTL 5min — shows pipeline is alive)
+                    try:
+                        r.set("pipeline:heartbeat", datetime.now(timezone.utc).isoformat(), ex=300)
+                    except Exception:
+                        pass
                     asyncio.run_coroutine_threadsafe(
                         self._run_cycle(symbol, timeframe),
                         self._loop,
@@ -78,8 +89,29 @@ class ScoringService:
         while True:
             await asyncio.sleep(60)
 
+    def _refresh_tp_cache(self) -> None:
+        """Refresh trading-params cache from DB. Called every _TP_CACHE_TTL cycles."""
+        try:
+            from db.connection import get_session_factory
+            from config.config_service import get_active_trading_params
+            db = get_session_factory()()
+            try:
+                self._tp_cache = get_active_trading_params(db)
+            finally:
+                db.close()
+        except Exception as exc:
+            logger.debug("TradingParams cache refresh failed (%s) — keeping previous values", exc)
+            if not self._tp_cache:
+                self._tp_cache = {}  # first-time failure → empty dict → defaults apply
+
     async def _run_cycle(self, symbol: str, timeframe: str) -> None:
         """Run one full scoring cycle for a symbol/timeframe."""
+        # Refresh trading-params cache periodically (weights, thresholds)
+        self._tp_cache_counter += 1
+        if self._tp_cache_counter >= self._TP_CACHE_TTL or not self._tp_cache:
+            self._refresh_tp_cache()
+            self._tp_cache_counter = 0
+
         import pandas as pd
         from indicators.atr import ATR
         from indicators.adx import ADX
@@ -363,17 +395,34 @@ class ScoringService:
             )
             bonus = compute_confluence_bonus(ohlcv, smc.order_blocks or smc.order_block, smc.fvg, vp.poc)
 
+            # --- Load weight multipliers & thresholds from DB (migration 006) ---
+            # Falls back to defaults (1.0 / 75 / 55) when columns are absent.
+            _w_of    = self._tp_cache.get("weight_of", 1.0)
+            _w_smc   = self._tp_cache.get("weight_smc", 1.0)
+            _w_vsa   = self._tp_cache.get("weight_vsa", 1.0)
+            _w_ctx   = self._tp_cache.get("weight_ctx", 1.0)
+            _w_bonus = self._tp_cache.get("weight_bonus", 1.0)
+            _alert_t = int(self._tp_cache.get("score_alert_threshold", 75))
+            _watch_t = int(self._tp_cache.get("score_watch_threshold", 55))
+
+            # Compute weight-adjusted max denominator
+            _max_raw_adj = 35.0*_w_of + 30.0*_w_smc + 30.0*_w_vsa + 15.0*_w_ctx + 15.0*_w_bonus
+
             # --- Final score ---
-            score = SignalScorer().score(ScoreInput(
-                order_flow=of.score,
-                smc=smc.score,
-                vsa=vsa.score,
-                context=ctx.score,
-                bonus=bonus,
+            score = SignalScorer(
+                alert_threshold=_alert_t,
+                watch_threshold=_watch_t,
+            ).score(ScoreInput(
+                order_flow=of.score   * _w_of,
+                smc=smc.score         * _w_smc,
+                vsa=vsa.score         * _w_vsa,
+                context=ctx.score     * _w_ctx,
+                bonus=bonus           * _w_bonus,
                 regime_multiplier=regime_state.score_multiplier,
                 direction=signal_direction,
                 regime=regime_state.regime,
                 order_book_available=order_book_available,
+                max_raw=_max_raw_adj,
             ))
 
             # Apply filter score adjustments (sum of all filter adjustments).
